@@ -85,12 +85,12 @@ fn patch_frame_benchmarking_current_time() {
             continue;
         }
 
-        if let Ok(content) = fs::read_to_string(&candidate) {
-            if content.contains(OLD) {
-                let updated = content.replacen(OLD, NEW, 1);
-                if fs::write(&candidate, updated).is_ok() {
-                    patched_any = true;
-                }
+        if let Ok(content) = fs::read_to_string(&candidate)
+            && content.contains(OLD)
+        {
+            let updated = content.replacen(OLD, NEW, 1);
+            if fs::write(&candidate, updated).is_ok() {
+                patched_any = true;
             }
         }
     }

@@ -1,6 +1,12 @@
 set shell := ["nu", "-c"]
 
 runtime_wasm := "target/release/wbuild/acuity-runtime/acuity_runtime.wasm"
+# The benchmark-enabled wasm is kept at a separate path: the recipe's trailing
+# `cargo build --release` (features off) rewrites `runtime_wasm`, so a bencher
+# run against that path afterwards would fail with "Did not find the benchmarking
+# runtime api". Copying it out lets you re-run single-pallet benchmarks right
+# after `just benchmark` without rebuilding.
+runtime_wasm_bench := "target/release/acuity-runtime-bench.wasm"
 chain_spec := "target/dev-chain-spec.json"
 
 default:
@@ -51,8 +57,9 @@ dev-node: chain-spec
 benchmark:
     if ((which frame-omni-bencher | length) == 0) { error make { msg: 'frame-omni-bencher is not installed or not on PATH' } }
     cargo build --release --features runtime-benchmarks
+    cp {{runtime_wasm}} {{runtime_wasm_bench}}
     frame-omni-bencher v1 benchmark pallet \
-      --runtime {{runtime_wasm}} \
+      --runtime {{runtime_wasm_bench}} \
       --all \
       --steps 50 \
       --repeat 20 \

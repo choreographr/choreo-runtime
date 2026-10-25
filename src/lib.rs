@@ -79,14 +79,6 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
     system_version: 1,
 };
 
-#[cfg(feature = "std")]
-pub fn native_version() -> NativeVersion {
-    NativeVersion {
-        runtime_version: VERSION,
-        can_author_with: Default::default(),
-    }
-}
-
 type TxExtension = (
     frame_system::AuthorizeCall<Runtime>,
     frame_system::CheckNonZeroSender<Runtime>,
@@ -199,7 +191,7 @@ impl pallet_timestamp::Config for Runtime {
     type Moment = u64;
     type OnTimestampSet = Aura;
     type MinimumPeriod = ConstU64<{ MILLI_SECS_PER_BLOCK / 2 }>;
-    type WeightInfo = ();
+    type WeightInfo = pallet_timestamp::weights::SubstrateWeight<Runtime>;
 }
 
 #[derive_impl(pallet_transaction_payment::config_preludes::TestDefaultConfig)]
@@ -207,6 +199,7 @@ impl pallet_transaction_payment::Config for Runtime {
     type OnChargeTransaction = pallet_transaction_payment::FungibleAdapter<Balances, ()>;
     type WeightToFee = NoFee<<Self as pallet_balances::Config>::Balance>;
     type LengthToFee = ConstantMultiplier<<Self as pallet_balances::Config>::Balance, ConstU128<1>>;
+    type WeightInfo = pallet_transaction_payment::weights::SubstrateWeight<Runtime>;
 }
 
 impl pallet_content::Config for Runtime {
@@ -238,7 +231,7 @@ impl pallet_utility::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
     type RuntimeCall = RuntimeCall;
     type PalletsOrigin = OriginCaller;
-    type WeightInfo = ();
+    type WeightInfo = weights::pallet_utility::WeightInfo<Runtime>;
 }
 
 #[cfg(feature = "runtime-benchmarks")]
@@ -262,6 +255,7 @@ mod benches {
         [pallet_balances, Balances]
         [pallet_content, Content]
         [pallet_content_reactions, ContentReactions]
+        [pallet_utility, Utility]
     );
 
     pub fn benchmark_metadata(
@@ -464,7 +458,7 @@ mod tests {
         frame_support::BoundedVec,
         sp_application_crypto::Ss58Codec,
         sp_keyring::Sr25519Keyring,
-        sp_runtime::{bounded_vec, BuildStorage, DispatchError, TokenError},
+        sp_runtime::{BuildStorage, DispatchError, TokenError, bounded_vec},
     };
     use serde_json::Value;
 
@@ -597,14 +591,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_version_and_native_version_are_consistent() {
+    fn runtime_version_is_consistent() {
         assert_eq!(VERSION.spec_name.as_ref(), "acuity-runtime");
         assert_eq!(VERSION.impl_name.as_ref(), "acuity-runtime");
         assert_eq!(VERSION.spec_version, 1);
         assert_eq!(VERSION.transaction_version, 1);
-
-        let native = native_version();
-        assert_eq!(native.runtime_version, VERSION);
+        assert_eq!(VERSION.apis.len(), RUNTIME_API_VERSIONS.len());
     }
 
     #[test]
@@ -877,7 +869,7 @@ mod tests {
                 DispatchError::Token(TokenError::FundsUnavailable)
             );
 
-            let new_account: AccountId = sp_runtime::AccountId32::from([0x42u8; 32]).into();
+            let new_account: AccountId = sp_runtime::AccountId32::from([0x42u8; 32]);
             assert_ok!(Balances::transfer_allow_death(
                 RuntimeOrigin::signed(alice()),
                 new_account.clone().into(),
