@@ -20,7 +20,7 @@ use sp_session::OpaqueGeneratedSessionKeys;
 
 pub mod genesis_config_presets {
     use super::*;
-    use crate::{BalancesConfig, ParachainSystemConfig, RuntimeGenesisConfig, SudoConfig};
+    use crate::{BalancesConfig, ParachainInfoConfig, RuntimeGenesisConfig, SudoConfig};
     use alloc::vec;
     use cumulus_primitives_core::ParaId;
     use serde_json::Value;
@@ -42,7 +42,7 @@ pub mod genesis_config_presets {
             aura: pallet_aura::GenesisConfig {
                 authorities: vec![dev_authority()],
             },
-            parachain_system: ParachainSystemConfig {
+            parachain_info: ParachainInfoConfig {
                 parachain_id: ParaId::new(1000),
             },
             sudo: SudoConfig {
@@ -115,36 +115,42 @@ mod runtime {
     pub type System = frame_system::Pallet<Runtime>;
 
     #[runtime::pallet_index(1)]
-    pub type Timestamp = pallet_timestamp::Pallet<Runtime>;
+    pub type ParachainSystem = cumulus_pallet_parachain_system::Pallet<Runtime>;
 
     #[runtime::pallet_index(2)]
-    pub type ParachainSystem = parachain_info::Pallet<Runtime>;
+    pub type Timestamp = pallet_timestamp::Pallet<Runtime>;
 
     #[runtime::pallet_index(3)]
-    pub type Aura = pallet_aura::Pallet<Runtime>;
+    pub type ParachainInfo = parachain_info::Pallet<Runtime>;
 
     #[runtime::pallet_index(4)]
-    pub type Balances = pallet_balances::Pallet<Runtime>;
+    pub type Aura = pallet_aura::Pallet<Runtime>;
 
     #[runtime::pallet_index(5)]
-    pub type Sudo = pallet_sudo::Pallet<Runtime>;
+    pub type AuraExt = cumulus_pallet_aura_ext::Pallet<Runtime>;
 
     #[runtime::pallet_index(6)]
-    pub type TransactionPayment = pallet_transaction_payment::Pallet<Runtime>;
+    pub type Balances = pallet_balances::Pallet<Runtime>;
 
     #[runtime::pallet_index(7)]
-    pub type Content = pallet_content::Pallet<Runtime>;
+    pub type Sudo = pallet_sudo::Pallet<Runtime>;
 
     #[runtime::pallet_index(8)]
-    pub type AccountContent = pallet_account_content::Pallet<Runtime>;
+    pub type TransactionPayment = pallet_transaction_payment::Pallet<Runtime>;
 
     #[runtime::pallet_index(9)]
-    pub type AccountProfile = pallet_account_profile::Pallet<Runtime>;
+    pub type Content = pallet_content::Pallet<Runtime>;
 
     #[runtime::pallet_index(10)]
-    pub type ContentReactions = pallet_content_reactions::Pallet<Runtime>;
+    pub type AccountContent = pallet_account_content::Pallet<Runtime>;
 
     #[runtime::pallet_index(11)]
+    pub type AccountProfile = pallet_account_profile::Pallet<Runtime>;
+
+    #[runtime::pallet_index(12)]
+    pub type ContentReactions = pallet_content_reactions::Pallet<Runtime>;
+
+    #[runtime::pallet_index(13)]
     pub type Utility = pallet_utility::Pallet<Runtime>;
 }
 
@@ -156,14 +162,37 @@ parameter_types! {
     pub const MaxMentions: u32 = 256;
     pub const MaxItemsPerAccount: u32 = 1024;
     pub const MaxEmojis: u32 = 16;
+    /// Messages from the relay chain are dropped for now: no DMP queue is
+    /// wired, so this reserves no block weight for processing them.
+    pub const ReservedDmpWeight: Weight = Weight::zero();
+    /// Same for XCMP: there is no XCMP queue pallet, so nothing is reserved.
+    pub const ReservedXcmpWeight: Weight = Weight::zero();
 }
 
-#[derive_impl(frame_system::config_preludes::SolochainDefaultConfig)]
+#[derive_impl(frame_system::config_preludes::ParaChainDefaultConfig)]
 impl frame_system::Config for Runtime {
     type Block = Block;
     type Version = Version;
     type AccountData = pallet_balances::AccountData<<Runtime as pallet_balances::Config>::Balance>;
     type SystemWeightInfo = weights::frame_system::WeightInfo<Runtime>;
+    type OnSetCode = cumulus_pallet_parachain_system::ParachainSetCode<Runtime>;
+}
+
+impl cumulus_pallet_parachain_system::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type OnSystemEvent = ();
+    type SelfParaId = ParachainInfo;
+    type OutboundXcmpMessageSource = ();
+    type DmpQueue = ();
+    type ReservedDmpWeight = ReservedDmpWeight;
+    type XcmpMessageHandler = ();
+    type ReservedXcmpWeight = ReservedXcmpWeight;
+    type CheckAssociatedRelayNumber =
+        cumulus_pallet_parachain_system::RelayNumberMonotonicallyIncreases;
+    type ConsensusHook = cumulus_pallet_parachain_system::consensus_hook::RequireParentIncluded;
+    type WeightInfo = ();
+    type RelayParentOffset = ConstU32<0>;
+    type SchedulingSignatureVerifier = ();
 }
 
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
@@ -183,6 +212,8 @@ impl pallet_aura::Config for Runtime {
 }
 
 impl parachain_info::Config for Runtime {}
+
+impl cumulus_pallet_aura_ext::Config for Runtime {}
 
 #[derive_impl(pallet_sudo::config_preludes::TestDefaultConfig)]
 impl pallet_sudo::Config for Runtime {}
@@ -367,7 +398,7 @@ impl_runtime_apis! {
 
     impl cumulus_primitives_core::GetParachainInfo<Block> for Runtime {
         fn parachain_id() -> cumulus_primitives_core::ParaId {
-            ParachainSystem::parachain_id()
+            ParachainInfo::parachain_id()
         }
     }
 
@@ -447,6 +478,14 @@ pub mod interface {
     pub type Balance = <Runtime as pallet_balances::Config>::Balance;
 }
 
+// The relay-chain validation function used by parachain validators to execute a
+// candidate block. `register_validate_block!` expands to nothing under `std`, so
+// this only affects the wasm build.
+cumulus_pallet_parachain_system::register_validate_block! {
+    Runtime = Runtime,
+    BlockExecutor = RuntimeExecutive,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,7 +532,7 @@ mod tests {
             aura: pallet_aura::GenesisConfig {
                 authorities: vec![Sr25519Keyring::Alice.public().into()],
             },
-            parachain_system: ParachainSystemConfig {
+            parachain_info: ParachainInfoConfig {
                 parachain_id: cumulus_primitives_core::ParaId::new(1000),
                 _config: Default::default(),
             },
@@ -559,7 +598,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            patch["parachainSystem"]["parachainId"],
+            patch["parachainInfo"]["parachainId"],
             Value::Number(1000u64.into())
         );
         assert_eq!(patch["sudo"]["key"], Value::String(alice().to_ss58check()));
@@ -617,7 +656,7 @@ mod tests {
             assert!(!Runtime::metadata_versions().is_empty());
 
             assert_eq!(
-                ParachainSystem::parachain_id(),
+                ParachainInfo::parachain_id(),
                 cumulus_primitives_core::ParaId::new(1000)
             );
             assert_eq!(
@@ -1343,6 +1382,55 @@ mod tests {
         }
     }
 
+    /// Hand the parachain its relay-chain context, exactly as the
+    /// `set_validation_data` inherent does in a real block. Every parachain
+    /// block needs it: `ParachainSystem::on_finalize` panics without it, and it
+    /// is what carries the relay parent number and messaging state.
+    fn set_validation_data() {
+        use cumulus_primitives_core::PersistedValidationData;
+        use cumulus_primitives_parachain_inherent::ParachainInherentData;
+        use cumulus_test_relay_sproof_builder::RelayStateSproofBuilder;
+
+        let parent_head = header(System::block_number()).encode();
+        let mut sproof_builder = RelayStateSproofBuilder {
+            para_id: cumulus_primitives_core::ParaId::new(1000),
+            ..Default::default()
+        };
+        sproof_builder.included_para_head = Some(parent_head.clone().into());
+        let (relay_parent_storage_root, relay_chain_state) =
+            sproof_builder.into_state_root_and_proof();
+
+        let data = ParachainInherentData {
+            validation_data: PersistedValidationData {
+                parent_head: parent_head.into(),
+                relay_parent_number: 1,
+                relay_parent_storage_root,
+                max_pov_size: 5 * 1024 * 1024,
+            },
+            relay_chain_state,
+            downward_messages: Default::default(),
+            horizontal_messages: Default::default(),
+            relay_parent_descendants: Default::default(),
+            collator_peer_id: None,
+        };
+
+        let mut inherent_data = sp_inherents::InherentData::default();
+        inherent_data
+            .put_data(
+                cumulus_primitives_parachain_inherent::INHERENT_IDENTIFIER,
+                &data,
+            )
+            .expect("inherent data fits");
+
+        use frame_support::{inherent::ProvideInherent, traits::UnfilteredDispatchable};
+
+        let call: RuntimeCall = ParachainSystem::create_inherent(&inherent_data)
+            .expect("a validation-data inherent is produced")
+            .into();
+        call.dispatch_bypass_filter(RuntimeOrigin::none())
+            .expect("the validation-data inherent dispatches");
+    }
+
     fn transfer_call() -> RuntimeCall {
         RuntimeCall::Balances(pallet_balances::Call::<Runtime>::transfer_allow_death {
             dest: bob().into(),
@@ -1354,6 +1442,7 @@ mod tests {
     fn signed_extrinsic_charges_fee_and_bumps_nonce() {
         new_test_ext().execute_with(|| {
             RuntimeExecutive::initialize_block(&header(System::block_number() + 1));
+            set_validation_data();
 
             let initial_alice = Balances::free_balance(alice());
             let initial_bob = Balances::free_balance(bob());
@@ -1431,6 +1520,7 @@ mod tests {
     fn signed_extrinsic_with_wrong_nonce_is_rejected() {
         new_test_ext().execute_with(|| {
             RuntimeExecutive::initialize_block(&header(System::block_number() + 1));
+            set_validation_data();
 
             let initial_alice = Balances::free_balance(alice());
 

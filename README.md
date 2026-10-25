@@ -1,6 +1,8 @@
 # Acuity Runtime
 
-This repo contains a minimal FRAME runtime called `Acuity Runtime` (`acuity-runtime`), intended to be run with `polkadot-omni-node`.
+This repo contains a FRAME parachain runtime called `Acuity Runtime` (`acuity-runtime`), intended to be run with `polkadot-omni-node`.
+
+It is wired as a parachain: `cumulus-pallet-parachain-system` owns the relay-chain context, and the built wasm exports the `validate_block` entry point that relay-chain validators call. Two things are deliberately **not** wired yet — inbound downward messages (DMP) and XCMP — so the chain drops relay-chain messages and cannot exchange cross-chain messages. See [ARCHITECTURE.md](./ARCHITECTURE.md#parachain-wiring) for exactly what that means.
 
 It targets `edition = "2024"`, uses the crates.io `polkadot-sdk` umbrella at **2609.0.0**, and builds with the **nightly** toolchain pinned in `rust-toolchain.toml` (see [ARCHITECTURE.md](./ARCHITECTURE.md) for the toolchain and stable-escape-hatch details).
 
@@ -56,7 +58,7 @@ polkadot-omni-node \
   --state-pruning archive-canonical
 ```
 
-The node runs in dev/manual-seal style mode and produces blocks locally (observed at 1s apart, which is why the recipe passes `--dev-block-time 1000`). The chain-spec command prints the output path when generation completes.
+The node runs in dev mode and produces blocks locally (observed at 1s apart, which is why the recipe passes `--dev-block-time 1000`). Dev mode also supplies the `set_validation_data` inherent each parachain block requires; without it the runtime panics at finalization. The chain-spec command prints the output path when generation completes.
 
 Note that `--dev-block-time` only affects the dev sealing driver: the runtime's own Aura slot duration is 6s (`MILLI_SECS_PER_BLOCK`).
 

@@ -16,6 +16,8 @@ dependencies = [
 name = "acuity-runtime"
 version = "0.1.0"
 dependencies = [
+ "cumulus-pallet-parachain-system",
+ "cumulus-test-relay-sproof-builder",
  "pallet-account-content",
  "pallet-account-profile",
  "pallet-content",

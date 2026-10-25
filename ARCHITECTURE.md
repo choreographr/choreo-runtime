@@ -4,7 +4,7 @@
 
 Acuity Runtime is a **FRAME runtime** (`acuity-runtime`) written in Rust. It compiles to a Wasm blob for on-chain execution and a native `rlib` for tooling, and it is driven by `polkadot-omni-node`. The runtime uses FRAME from the Polkadot SDK, sourced as the published crates.io `polkadot-sdk` umbrella (**2609.0.0**) rather than a git tag.
 
-It is currently a **dev-mode chain**, not a production parachain: fees are effectively zero on the weight axis, `Sudo` is composed in, and there is no cumulus parachain-system pallet (see [Not yet a parachain](#not-yet-a-parachain)).
+It is wired as a **parachain**: `cumulus-pallet-parachain-system` owns the relay-chain context, the wasm exports the `validate_block` entry point, and the relay-chain inherents are part of every block. It is still a **dev-mode chain** in its economics — fees are zero on the weight axis and `Sudo` is composed in — and it has **no XCM stack yet** (see [Parachain wiring](#parachain-wiring)).
 
 ## Tech Stack
 
@@ -52,30 +52,39 @@ acuity-runtime/
 
 ## Pallet Architecture
 
-The runtime wires together 12 pallets in `src/lib.rs` via the `#[frame_construct_runtime]` macro:
+The runtime wires together 14 pallets in `src/lib.rs` via the `#[frame_construct_runtime]` macro:
 
 | Index | Runtime name | Pallet crate | Source | Responsibility |
 |---|---|---|---|---|
-| 0 | `System` | `frame_system` | polkadot-sdk | Block execution, events, account nonce |
-| 1 | `Timestamp` | `pallet_timestamp` | polkadot-sdk | On-chain timestamp; drives Aura slot duration |
-| 2 | `ParachainSystem` | `staging_parachain_info` | polkadot-sdk | Stores the `ParaId` only — no consensus or messaging data |
-| 3 | `Aura` | `pallet_aura` | polkadot-sdk | Block authorship consensus (sr25519 authorities) |
-| 4 | `Balances` | `pallet_balances` | polkadot-sdk | Token balances, transfers, existential deposit |
-| 5 | `Sudo` | `pallet_sudo` | polkadot-sdk | Superuser key (dev mode) |
-| 6 | `TransactionPayment` | `pallet_transaction_payment` | polkadot-sdk | Transaction fee computation |
-| 7 | `Content` | `pallet_content` | choreographr/pallet-content | Publish, revise, retract content items (IPFS hashes) |
-| 8 | `AccountContent` | `pallet_account_content` | choreographr/pallet-content | Maps accounts to owned content items |
-| 9 | `AccountProfile` | `pallet_account_profile` | choreographr/pallet-content | Sets an account's profile to a content item |
-| 10 | `ContentReactions` | `pallet_content_reactions` | choreographr/pallet-content | Emoji reactions on content items (per revision) |
-| 11 | `Utility` | `pallet_utility` | polkadot-sdk | Batch/union dispatch of calls |
+| 0 | `System` | `frame_system` | polkadot-sdk | Block execution, events, account nonce; parachain prelude |
+| 1 | `ParachainSystem` | `cumulus_pallet_parachain_system` | polkadot-sdk (cumulus) | Relay-chain context: validation data, relay parent number, messaging state, code upgrades |
+| 2 | `Timestamp` | `pallet_timestamp` | polkadot-sdk | On-chain timestamp; drives Aura slot duration |
+| 3 | `ParachainInfo` | `staging_parachain_info` | polkadot-sdk | Stores the `ParaId` |
+| 4 | `Aura` | `pallet_aura` | polkadot-sdk | Block authorship consensus (sr25519 authorities) |
+| 5 | `AuraExt` | `cumulus_pallet_aura_ext` | polkadot-sdk (cumulus) | Snapshots Aura authorities for the collator |
+| 6 | `Balances` | `pallet_balances` | polkadot-sdk | Token balances, transfers, existential deposit |
+| 7 | `Sudo` | `pallet_sudo` | polkadot-sdk | Superuser key (dev mode) |
+| 8 | `TransactionPayment` | `pallet_transaction_payment` | polkadot-sdk | Transaction fee computation |
+| 9 | `Content` | `pallet_content` | choreographr/pallet-content | Publish, revise, retract content items (IPFS hashes) |
+| 10 | `AccountContent` | `pallet_account_content` | choreographr/pallet-content | Maps accounts to owned content items |
+| 11 | `AccountProfile` | `pallet_account_profile` | choreographr/pallet-content | Sets an account's profile to a content item |
+| 12 | `ContentReactions` | `pallet_content_reactions` | choreographr/pallet-content | Emoji reactions on content items (per revision) |
+| 13 | `Utility` | `pallet_utility` | polkadot-sdk | Batch/union dispatch of calls |
 
-The index 2 alias is easy to misread: `ParachainSystem` here is `staging_parachain_info::Pallet`, which only stores a `ParaId`. It is not cumulus's `cumulus-pallet-parachain-system`.
+### Parachain wiring
 
-### Not yet a parachain
+- `frame_system` uses `frame_system::config_preludes::ParaChainDefaultConfig` with `type OnSetCode = cumulus_pallet_parachain_system::ParachainSetCode<Runtime>`, so runtime code upgrades go through the parachain-system upgrade path rather than a local `set_code`.
+- `cumulus_pallet_parachain_system::Config` is wired with `SelfParaId = ParachainInfo`, `CheckAssociatedRelayNumber = RelayNumberMonotonicallyIncreases`, `ConsensusHook = consensus_hook::RequireParentIncluded` (the parent must be included before the next block is authored), `RelayParentOffset = ConstU32<0>`, and `SchedulingSignatureVerifier = ()` (V3 scheduling disabled, as upstream advises).
+- `register_validate_block!` in `src/lib.rs` emits the `validate_block` export that relay-chain validators call; it expands to nothing under `std`. The built wasm contains that export.
+- Every block must carry the `set_validation_data` inherent; `ParachainSystem::on_finalize` panics without it. The test suite supplies it through `cumulus-test-relay-sproof-builder`.
 
-- `frame_system` uses `SolochainDefaultConfig`, not a parachain prelude.
-- There is no `cumulus-pallet-parachain-system`, so no relay-chain validation function is registered, no relay-chain inherents are consumed, and there are no DMP/UMP/XCMP paths. The pallet at index 2 cannot substitute for it.
-- The chain runs under `polkadot-omni-node --dev` with `--dev-block-time 1000`; the runtime's own Aura slot duration is 6s. The dev sealing driver is what produces 1s blocks.
+**No messaging yet.** `DmpQueue = ()`, `XcmpMessageHandler = ()`, `OutboundXcmpMessageSource = ()`, and both `ReservedDmpWeight` / `ReservedXcmpWeight` are zero. The consequences are deliberate and worth stating plainly:
+
+- Inbound downward messages from the relay chain are **dropped**, not processed.
+- The chain cannot send or receive XCMP messages; there is no HRMP channel support.
+- Adding either means pulling in the XCM stack: `pallet-message-queue` plus `pallet-xcm` + `staging-xcm-builder` + `staging-xcm-executor` for DMP, and `cumulus-pallet-xcmp-queue` for XCMP. The message-queue `MessageProcessor` must be an `XcmExecutor`, so this is not a drop-in swap.
+
+`ParachainSystem` has no generated weights (`type WeightInfo = ()`, the SDK's hand-written default); its benchmarks are not in `define_benchmarks!` yet.
 
 ### Weight wiring
 
@@ -85,8 +94,9 @@ Which `WeightInfo` each pallet uses:
 |---|---|
 | `frame_system`, `pallet_balances`, `pallet_content`, `pallet_account_content`, `pallet_account_profile`, `pallet_content_reactions`, `pallet_utility` | generated files in `src/weights/` |
 | `pallet_timestamp`, `pallet_transaction_payment` | SDK `weights::SubstrateWeight<Runtime>` |
+| `cumulus_pallet_parachain_system` | `()` — the SDK's hand-written default; not benchmarked here |
 | `pallet_sudo` | `()` via its config prelude — unweighted, dev-only |
-| `pallet_aura` | no `WeightInfo` in its config |
+| `pallet_aura`, `pallet_aura_ext`, `staging_parachain_info` | no `WeightInfo` in their configs |
 
 ### Cross-Pallet Dependencies
 
@@ -123,6 +133,8 @@ Balances ←── TransactionPayment (FungibleAdapter for fees)
 | `MaxItemsPerAccount` | 1024 | Account content item limit |
 | `MaxEmojis` | 16 | Reaction emoji limit per user per (item, revision) |
 | `ExistentialDeposit` | 1 | Balances minimum |
+| `ParaId` (genesis `parachainInfo`) | 1000 | `ParachainInfo`; consumed by `ParachainSystem::SelfParaId` |
+| `ReservedDmpWeight` / `ReservedXcmpWeight` | `Weight::zero()` | Nothing is reserved: no DMP/XCMP queues are wired |
 
 ### Fee Model (dev)
 
@@ -138,7 +150,7 @@ The single preset (`development`) configures:
 - Alice and Bob with `1_000_000_000_000_000` balance each
 - Alice as sole Aura authority
 - Alice as Sudo key (dev only — remove `pallet_sudo` before any production use)
-- `ParaId(1000)` for the parachain-info pallet
+- `ParaId(1000)` in the `parachainInfo` genesis entry (the parachain-system genesis is left at its defaults)
 
 `preset_names()` returns only this one preset; there is no `local`/`live` split yet.
 
@@ -163,7 +175,7 @@ Implemented in `impl_runtime_apis!`:
 - **OffchainWorkerApi** — offchain_worker
 - **SessionKeys** — generate_session_keys, decode_session_keys (both return defaults; there is no session pallet)
 - **AuraApi** — slot_duration, authorities
-- **GetParachainInfo** — parachain_id
+- **GetParachainInfo** — parachain_id (read from `ParachainInfo`)
 - **AccountNonceApi** — account_nonce
 - **TransactionPaymentApi** — query_info, query_fee_details, query_weight_to_fee, query_length_to_fee
 - **GenesisBuilder** — build_state, get_preset, preset_names
@@ -251,6 +263,8 @@ Weight measurements are machine- and toolchain-specific; regenerate after any SD
 
 - `polkadot-sdk` is pinned to a single umbrella version used by both `[dependencies]` and `[build-dependencies]`.
 - The content pallets (`pallet-content`, `pallet-account-content`, `pallet-account-profile`, `pallet-content-reactions`) come from `https://github.com/choreographr/pallet-content` on `branch = "master"`, locked by `Cargo.lock` to a specific commit.
+- `cumulus-pallet-parachain-system` is declared **twice**: once as an umbrella feature (for the `polkadot_sdk::cumulus_pallet_parachain_system` re-export) and once as a direct dependency, because the `register_validate_block!` proc macro resolves its own crate by name from `Cargo.toml` via `proc-macro-crate`. Both must stay on the umbrella's version.
+- `cumulus-test-relay-sproof-builder` is a dev-dependency only, used to fabricate validation data in tests.
 - **The runtime and that repo must stay on the same `polkadot-sdk` major line.** The umbrella's `frame_support` / `frame_system` / `sp_io` re-exports are feature-gated, so if the two resolve different `polkadot-sdk` versions, cargo keeps two copies and the external pallets fail with `unresolved imports ... no frame_support in the root`. Following `branch = "master"` means an upstream push can trigger this without warning; pinning to a `rev` and building with `--locked` makes it deliberate.
 
 ## `no_std` Architecture
@@ -261,7 +275,7 @@ Weight measurements are machine- and toolchain-specific; regenerate after any SD
 
 ## Testing
 
-The suite lives in `src/lib.rs` (`#[cfg(test)] mod tests`) and runs under `cargo-nextest` via `just test-fast` — 31 tests: 29 written in-crate plus the two macro-generated ones (`test_genesis_config_builds` and `__construct_runtime_integrity_test::runtime_integrity_tests`).
+The suite lives in `src/lib.rs` (`#[cfg(test)] mod tests`) and runs under `cargo-nextest` via `just test-fast` — 33 tests: 31 written in-crate plus the two macro-generated ones (`test_genesis_config_builds` and `__construct_runtime_integrity_test::runtime_integrity_tests`).
 
 Coverage by area:
 
@@ -283,6 +297,10 @@ Coverage by area:
 16. **Utility batch** — batch dispatch of multiple calls
 17. **Balances accounting** — free balances update after transfers
 
-Not covered yet: a signed extrinsic driven through `TxExtension`/`Executive` end to end (nonce bump, fee charge, weight refund, block weight accounting). All tests are pallet-level dispatch.
+18. **Signed extrinsics** — a real signed extrinsic built and signed the way a client does, applied through `TxExtension`/`Executive`: nonce bump, length-fee charge, block-weight accounting (extension weight + call weight + base extrinsic weight), emitted events, and block finalization; plus a future nonce rejected as `InvalidTransaction::Future` and a replay rejected as `Stale`
+
+The two block-level tests call `set_validation_data()` first, which fabricates a relay-chain storage proof with `cumulus-test-relay-sproof-builder` (a dev-dependency) and dispatches the inherent through `create_inherent` + `dispatch_bypass_filter`. Without it `finalize_block` panics, because a parachain block cannot finalize without validation data.
+
+Not covered yet: `check_inherents` against a full candidate block, and actual relay-chain validation of the `validate_block` entry point (that needs a relay chain).
 
 `just release-checks` is the release gate: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, then `cargo test-fast`.
