@@ -2,18 +2,22 @@
 
 ## Overview
 
-Acuity Runtime is a **Substrate/Polkadot parachain runtime** written in Rust. It compiles to a Wasm blob for on-chain execution and a native `rlib` for tooling. The runtime uses the FRAME framework from the Polkadot SDK, sourced as the published crates.io `polkadot-sdk` umbrella (`2606.1.0`) rather than a git tag.
+Acuity Runtime is a **FRAME runtime** (`acuity-runtime`) written in Rust. It compiles to a Wasm blob for on-chain execution and a native `rlib` for tooling, and it is driven by `polkadot-omni-node`. The runtime uses FRAME from the Polkadot SDK, sourced as the published crates.io `polkadot-sdk` umbrella (**2609.0.0**) rather than a git tag.
+
+It is currently a **dev-mode chain**, not a production parachain: fees are effectively zero on the weight axis, `Sudo` is composed in, and there is no cumulus parachain-system pallet (see [Not yet a parachain](#not-yet-a-parachain)).
 
 ## Tech Stack
 
 | Component | Technology |
 |---|---|
 | Language | Rust (edition 2024) |
-| Framework | Substrate/Polkadot SDK (FRAME) |
+| Toolchain | nightly, pinned in `rust-toolchain.toml` (stable via `scripts/build-stable.sh`) |
+| Framework | Polkadot SDK `polkadot-sdk` v2609.0.0 (FRAME) |
 | Encoding | Parity Scale Codec v3.7.5, scale-info v2.11.6 |
-| Serialization | serde_json v1.0.145 (genesis presets) |
+| Serialization | serde_json v1.0.154 (genesis presets) |
 | Build | Cargo + `substrate-wasm-builder` |
 | Task Runner | `just` (shell: Nushell) |
+| Test Runner | `cargo-nextest` (libtest fallback available) |
 | Node Runner | `polkadot-omni-node` |
 | Benchmarking | `frame-omni-bencher` |
 | Output | `cdylib` (Wasm blob) + `rlib` (native lib) |
@@ -32,13 +36,17 @@ acuity-runtime/
 │       ├── pallet_account_content.rs
 │       ├── pallet_account_profile.rs
 │       ├── pallet_content_reactions.rs
-│       └── generated/       # Placeholder for generated weight output
+│       └── pallet_utility.rs
 ├── templates/
 │   └── runtime-weight-template.hbs  # Handlebars template for weight file generation
-├── scripts/                  # Placeholder for future scripts
+├── scripts/
+│   └── build-stable.sh      # One-shot stable-toolchain escape hatch
+├── .cargo/config.toml        # profile-rustflags opt-in + nextest aliases
+├── rust-toolchain.toml       # nightly default toolchain
 ├── build.rs                  # Build script: patches frame-benchmarking + invokes wasm-builder
-├── Cargo.toml                # Crate manifest
-├── justfile                  # Task recipes (build, chain-spec, dev-node, benchmark)
+├── Cargo.toml                # Crate manifest (dev/release/dist profiles)
+├── justfile                  # Task recipes (build, chain-spec, dev-node, benchmark, tests)
+├── ARCHITECTURE.md
 └── README.md
 ```
 
@@ -46,20 +54,39 @@ acuity-runtime/
 
 The runtime wires together 12 pallets in `src/lib.rs` via the `#[frame_construct_runtime]` macro:
 
-| Index | Pallet | Source | Responsibility |
-|---|---|---|---|
-| 0 | `System` | polkadot-sdk | Block execution, events, account nonce |
-| 1 | `Timestamp` | polkadot-sdk | On-chain timestamp; drives Aura slot duration |
-| 2 | `ParachainSystem` | polkadot-sdk (cumulus) | Parachain identity and consensus data |
-| 3 | `Aura` | polkadot-sdk | Block authorship consensus (sr25519 authorities) |
-| 4 | `Balances` | polkadot-sdk | Token balances, transfers, existential deposit |
-| 5 | `Sudo` | polkadot-sdk | Superuser key (dev mode) |
-| 6 | `TransactionPayment` | polkadot-sdk | Transaction fee computation |
-| 7 | `Content` | choreographr/pallet-content | Publish, revise, retract content items (IPFS hashes) |
-| 8 | `AccountContent` | choreographr/pallet-content | Maps accounts to owned content items |
-| 9 | `AccountProfile` | choreographr/pallet-content | Sets an account's profile to a content item |
-| 10 | `ContentReactions` | choreographr/pallet-content | Emoji reactions on content items (per revision) |
-| 11 | `Utility` | polkadot-sdk | Batch/union dispatch of calls |
+| Index | Runtime name | Pallet crate | Source | Responsibility |
+|---|---|---|---|---|
+| 0 | `System` | `frame_system` | polkadot-sdk | Block execution, events, account nonce |
+| 1 | `Timestamp` | `pallet_timestamp` | polkadot-sdk | On-chain timestamp; drives Aura slot duration |
+| 2 | `ParachainSystem` | `staging_parachain_info` | polkadot-sdk | Stores the `ParaId` only — no consensus or messaging data |
+| 3 | `Aura` | `pallet_aura` | polkadot-sdk | Block authorship consensus (sr25519 authorities) |
+| 4 | `Balances` | `pallet_balances` | polkadot-sdk | Token balances, transfers, existential deposit |
+| 5 | `Sudo` | `pallet_sudo` | polkadot-sdk | Superuser key (dev mode) |
+| 6 | `TransactionPayment` | `pallet_transaction_payment` | polkadot-sdk | Transaction fee computation |
+| 7 | `Content` | `pallet_content` | choreographr/pallet-content | Publish, revise, retract content items (IPFS hashes) |
+| 8 | `AccountContent` | `pallet_account_content` | choreographr/pallet-content | Maps accounts to owned content items |
+| 9 | `AccountProfile` | `pallet_account_profile` | choreographr/pallet-content | Sets an account's profile to a content item |
+| 10 | `ContentReactions` | `pallet_content_reactions` | choreographr/pallet-content | Emoji reactions on content items (per revision) |
+| 11 | `Utility` | `pallet_utility` | polkadot-sdk | Batch/union dispatch of calls |
+
+The index 2 alias is easy to misread: `ParachainSystem` here is `staging_parachain_info::Pallet`, which only stores a `ParaId`. It is not cumulus's `cumulus-pallet-parachain-system`.
+
+### Not yet a parachain
+
+- `frame_system` uses `SolochainDefaultConfig`, not a parachain prelude.
+- There is no `cumulus-pallet-parachain-system`, so no relay-chain validation function is registered, no relay-chain inherents are consumed, and there are no DMP/UMP/XCMP paths. The pallet at index 2 cannot substitute for it.
+- The chain runs under `polkadot-omni-node --dev` with `--dev-block-time 1000`; the runtime's own Aura slot duration is 6s. The dev sealing driver is what produces 1s blocks.
+
+### Weight wiring
+
+Which `WeightInfo` each pallet uses:
+
+| Pallet | Weight source |
+|---|---|
+| `frame_system`, `pallet_balances`, `pallet_content`, `pallet_account_content`, `pallet_account_profile`, `pallet_content_reactions`, `pallet_utility` | generated files in `src/weights/` |
+| `pallet_timestamp`, `pallet_transaction_payment` | SDK `weights::SubstrateWeight<Runtime>` |
+| `pallet_sudo` | `()` via its config prelude — unweighted, dev-only |
+| `pallet_aura` | no `WeightInfo` in its config |
 
 ### Cross-Pallet Dependencies
 
@@ -84,9 +111,11 @@ Balances ←── TransactionPayment (FungibleAdapter for fees)
 
 ### Constants
 
-| Constant | Value | Used By |
+| Constant / binding | Value | Used By |
 |---|---|---|
-| `MILLI_SECS_PER_BLOCK` | 6000 (6s) | Timestamp/Aura slot duration |
+| `MILLI_SECS_PER_BLOCK` | 6000 (6s) | Aura slot duration; `Timestamp::MinimumPeriod` = half of it (3s) |
+| `Aura::MaxAuthorities` | `ConstU32<32>` | Aura authority set bound |
+| `Aura::AllowMultipleBlocksPerSlot` | `ConstBool<false>` | Aura |
 | `ItemIdNamespace` | 1000 | Content item ID derivation |
 | `MaxParents` | 32 | Content item parent links |
 | `MaxLinks` | 128 | Content item links |
@@ -97,16 +126,21 @@ Balances ←── TransactionPayment (FungibleAdapter for fees)
 
 ### Fee Model (dev)
 
-- **Weight-to-fee**: `NoFee` (zero) — no cost for computation weight
+- **Weight-to-fee**: `NoFee` (zero) — computation weight costs nothing
 - **Length-to-fee**: `ConstantMultiplier<Balance, ConstU128<1>>` — 1 unit per byte
+
+So the only price signal is transaction length. Block weight is still bounded by `CheckWeight` for extrinsics that declare weight correctly — which is why every composed pallet needs a real `WeightInfo` rather than `()`; a zero declared weight cannot be gated up front.
 
 ### Genesis Preset
 
-The `development` preset configures:
+The single preset (`development`) configures:
+
 - Alice and Bob with `1_000_000_000_000_000` balance each
 - Alice as sole Aura authority
-- Alice as Sudo key
-- `ParaId(1000)` for parachain identity
+- Alice as Sudo key (dev only — remove `pallet_sudo` before any production use)
+- `ParaId(1000)` for the parachain-info pallet
+
+`preset_names()` returns only this one preset; there is no `local`/`live` split yet.
 
 ## Transaction Pipeline
 
@@ -127,7 +161,7 @@ Implemented in `impl_runtime_apis!`:
 - **BlockBuilder** — apply_extrinsic, finalize_block, inherent_extrinsics, check_inherents
 - **TaggedTransactionQueue** — validate_transaction
 - **OffchainWorkerApi** — offchain_worker
-- **SessionKeys** — generate_session_keys, decode_session_keys
+- **SessionKeys** — generate_session_keys, decode_session_keys (both return defaults; there is no session pallet)
 - **AuraApi** — slot_duration, authorities
 - **GetParachainInfo** — parachain_id
 - **AccountNonceApi** — account_nonce
@@ -141,54 +175,83 @@ Implemented in `impl_runtime_apis!`:
 
 1. `Content::publish_item(origin, nonce, parents, flags, links, mentions, ipfs_hash)`
 2. Item ID derived via `Blake2-256(account, nonce, ItemIdNamespace)`
-3. `Content::ItemState` populated with owner, flags, revision_id
-4. `Content::publish_revision` bumps revision_id
-5. `Content::retract_item` sets `RETRACTED` flag (blocks further revisions)
-6. `Content::set_not_revisionable` / `set_not_retractable` remove flags
+3. `Content::ItemState` map populated with `Item { owner, revision_id, flags }`
+4. `Content::publish_revision` bumps `revision_id`
+5. `Content::retract_item` sets the `RETRACTED` flag (blocks further revisions)
+6. `Content::set_not_revisionable` / `set_not_retractable` clear the corresponding permission flags
+
+Flag bits: `REVISIONABLE = 1 << 0`, `RETRACTABLE = 1 << 1`, `RETRACTED = 1 << 2`.
 
 ### Account Content & Profile
 
-1. `AccountContent::add_item(origin, item_id)` — verifies ownership via `Content::ItemState`, adds to account list
-2. `AccountProfile::set_profile(origin, item_id)` — verifies ownership, sets as profile
+1. `AccountContent::add_item(origin, item_id)` — verifies ownership via `Content::ItemState`, adds to the account's list
+2. `AccountProfile::set_profile(origin, item_id)` — verifies ownership, sets it as the profile pointer
 3. Only the item owner can add or profile their items (`WrongAccount` error otherwise)
-4. `AccountContent::remove_item` removes item from account list
+4. `AccountContent::remove_item` removes an item from the list
+5. Read helpers: `get_item_count`, `get_item_exists`, `get_all_items` (plus per-account variants)
 
 ### Content Reactions
 
-1. `ContentReactions::add_reaction(origin, item_id, revision_id, Emoji)` — verifies item exists
-2. Reactions are per-revision: different revisions can have different reactions from the same user
-3. Maximum `MaxEmojis` (16) emojis per account per (item, revision)
-4. `ContentReactions::remove_reaction` removes a specific emoji
+1. `ContentReactions::set_reactions(origin, item_id, revision_id, reactions)` — verifies the item exists, then replaces the caller's reaction set for that revision
+2. Reactions are per-revision: the same user can react differently to different revisions
+3. Maximum `MaxEmojis` (16) emojis per account per (item, revision); duplicates rejected with `DuplicateEmoji`
+4. An empty vector clears the caller's reactions
 
 ## Build System
+
+### Toolchain and profiles
+
+- `rust-toolchain.toml` pins `channel = "nightly"` so every plain `cargo` invocation gets the fast per-profile flags without the caller doing anything.
+- `.cargo/config.toml` opts in to `[unstable] profile-rustflags`, which lets `Cargo.toml` scope rustflags per profile. `[profile.dev]` applies `-Zshare-generics=yes`, `--jobs-frontend=0`, and `-C target-cpu=native` (the last one never reaches a shipped artifact or the wasm build).
+- `[profile.release]` is `opt-level = 3` with no LTO, to keep local links fast; `[profile.dist]` adds `lto = "thin"`, `codegen-units = 1`, `incremental = false`, `strip = "symbols"` for shipped artifacts.
+- Building on **stable** is an explicit opt-out: `scripts/build-stable.sh` temporarily strips the nightly-only config/manifest keys, runs `cargo +stable <args>`, and restores them. Wired as `just build-stable` / `just check-stable` / `just test-stable`.
 
 ### Build Process
 
 1. `cargo build --release` compiles the runtime
-2. `build.rs` runs first: patches `frame-benchmarking` no-std bug, then invokes `substrate-wasm-builder`
-3. Output: `target/release/wbuild/acuity-runtime/acuity_runtime.wasm`
+2. `build.rs` runs first: patches `frame-benchmarking`'s no-std bug, then invokes `substrate-wasm-builder`
+3. Output: `target/release/wbuild/acuity-runtime/acuity_runtime.wasm` (plus `compact` and `compact.compressed` variants)
 
 ### Build Patch
 
-`build.rs` patches `frame-benchmarking`'s `current_time()` function to return `0u128.to_le_bytes()` in `no_std` mode, allowing Wasm benchmark builds to succeed. This workaround can be removed once the upstream issue is fixed.
+`build.rs` rewrites `frame-benchmarking`'s `current_time()` to return `0u128.to_le_bytes()` under `not(feature = "std")`, which is what allows benchmark Wasm builds to succeed. The bug is still present in `frame-benchmarking 50.0.0`, the version pulled in by `polkadot-sdk 2609.0.0`.
+
+The patch edits the crate source in the cargo registry (`$CARGO_HOME/registry/src/.../frame-benchmarking-*/src/utils.rs`) and in git checkouts, matching the old function body verbatim. Consequences worth knowing: the mutation is non-hermetic and persists in the shared registry cache, and it silently does nothing if upstream reflows that code. It prints a `cargo:warning=` only when it actually patches.
 
 ### Task Recipes (`justfile`)
 
 | Recipe | Purpose |
 |---|---|
 | `build` | Compile runtime (`cargo build --release`) |
-| `build-benchmarks` | Compile with `runtime-benchmarks` feature |
-| `chain-spec` | Generate dev chain spec using built Wasm |
-| `dev-node` | Start local dev node (1s blocks, archive pruning) |
-| `benchmark` | Full benchmark cycle: build, run bencher, generate weights, rebuild |
+| `build-benchmarks` | Compile with the `runtime-benchmarks` feature |
+| `chain-spec` | Generate dev chain spec using the built Wasm (depends on `build`) |
+| `dev-node` | Regenerate chain spec and start local dev node (1s blocks, archive state pruning) |
+| `benchmark` / `bench` | Full benchmark cycle: build with feature, copy wasm, run bencher, regenerate weights, rebuild clean |
+| `run` | Alias of `dev-node` |
+| `test` / `test-fast` | Unit tests via `cargo nextest run` (default features) |
+| `test-all-features` | Unit tests with every optional feature on |
+| `test-libtest` | Unit tests via plain `cargo test` |
+| `install-nextest` | `cargo install cargo-nextest` |
+| `release-checks` | `cargo fmt --check`, then `clippy --all-targets --all-features -D warnings`, then `test-fast` |
+| `build-stable` / `check-stable` / `test-stable` | One-command stable-toolchain escape hatch |
+| `about` / `menu` / `default` | Recipe listing and Nushell task selector |
 
 ### Benchmarking Pipeline
 
-1. `just build-benchmarks` enables `runtime-benchmarks` feature
-2. `frame-omni-bencher v1 benchmark pallet` runs against the Wasm blob using `templates/runtime-weight-template.hbs`
-3. Template generates Rust weight files implementing each pallet's `WeightInfo` trait
-4. The template has special-case handling for `publish_item` and `publish_revision` parameter names
-4. `just build` recompiles with the generated weights
+1. `cargo build --release --features runtime-benchmarks` produces a wasm exposing the Benchmark API
+2. That wasm is copied to `target/release/acuity-runtime-bench.wasm`, because the recipe's final clean rebuild overwrites the `wbuild` path
+3. `frame-omni-bencher v1 benchmark pallet --all --steps 50 --repeat 20 --template templates/runtime-weight-template.hbs --output src/weights` benchmarks against the copy
+4. The template emits one Rust file per pallet implementing that pallet's `weights::WeightInfo` trait, using the `WeightInfo<T>` struct shape the runtime expects
+5. The template special-cases the component parameter names of `publish_item` (three components) and `publish_revision` (two)
+6. `cargo build --release` recompiles with the generated weights as a compile check
+
+Weight measurements are machine- and toolchain-specific; regenerate after any SDK bump, pallet change, or hardware move.
+
+## Dependency Policy
+
+- `polkadot-sdk` is pinned to a single umbrella version used by both `[dependencies]` and `[build-dependencies]`.
+- The content pallets (`pallet-content`, `pallet-account-content`, `pallet-account-profile`, `pallet-content-reactions`) come from `https://github.com/choreographr/pallet-content` on `branch = "master"`, locked by `Cargo.lock` to a specific commit.
+- **The runtime and that repo must stay on the same `polkadot-sdk` major line.** The umbrella's `frame_support` / `frame_system` / `sp_io` re-exports are feature-gated, so if the two resolve different `polkadot-sdk` versions, cargo keeps two copies and the external pallets fail with `unresolved imports ... no frame_support in the root`. Following `branch = "master"` means an upstream push can trigger this without warning; pinning to a `rev` and building with `--locked` makes it deliberate.
 
 ## `no_std` Architecture
 
@@ -198,21 +261,28 @@ Implemented in `impl_runtime_apis!`:
 
 ## Testing
 
-Integration tests in `src/lib.rs` cover:
+The suite lives in `src/lib.rs` (`#[cfg(test)] mod tests`) and runs under `cargo-nextest` via `just test-fast` — 31 tests: 29 written in-crate plus the two macro-generated ones (`test_genesis_config_builds` and `__construct_runtime_integrity_test::runtime_integrity_tests`).
 
-1. **Genesis presets** — development config contains expected values
-2. **Runtime version** — spec/impl names and versions are consistent
+Coverage by area:
+
+1. **Genesis presets** — development config contains expected balances, ParaId, sudo key, authority count; preset helpers expose/lookup correctly
+2. **Runtime version** — spec/impl names and versions; API version list matches `RUNTIME_API_VERSIONS`
 3. **Configuration constants** — all `parameter_types!` match expected values
-4. **Transaction fees** — zero weight fee, linear length fee
-5. **Content flow** — publish, revise, retract, and retraction blocking
-6. **Account content/profile** — ownership verification, add/remove items, set profile
-7. **Content reactions** — per-revision tracking, emoji limits, removal
-8. **Content bounds** — BoundedVec limits for parents, links, mentions
-9. **Balances** — transfers, insufficient balance, existential deposit
-10. **Sudo** — genesis key is set correctly
-11. **Content error paths** — invalid flags, duplicate publish, set_not_revisionable, set_not_retractable, wrong owner, nonexistent item
-12. **Account content error paths** — duplicate add, remove not-added, retracted item rejection
-13. **Account profile overwrites** — profile pointer can be replaced
-14. **Content reactions error paths** — nonexistent item/revision, invalid emoji, duplicate no-op, remove absent, retracted item
-15. **Utility batch** — batch dispatch of multiple calls
-16. **Account balance tracking** — free balance updates after transfers
+4. **Metadata & config** — metadata encodes, ParaId, Aura authorities, slot duration
+5. **Transaction fees** — zero weight fee, linear length fee
+6. **Content flow** — publish, revise, retract, and retraction blocking
+7. **Account content/profile** — ownership verification, add/remove items, set profile
+8. **Content reactions** — per-revision tracking, emoji limits, duplicate rejection, clearing
+9. **Content bounds** — BoundedVec limits for parents, links, mentions
+10. **Balances** — transfers, insufficient balance, existential deposit
+11. **Sudo** — genesis key is set correctly
+12. **Content error paths** — invalid flags, duplicate publish, `set_not_revisionable`, `set_not_retractable`, wrong owner, nonexistent item
+13. **Account content error paths** — duplicate add, remove not-added, retracted item rejection
+14. **Account profile overwrites** — profile pointer can be replaced
+15. **Content reactions error paths** — nonexistent item/revision, invalid emoji, duplicate no-op, remove absent, retracted item
+16. **Utility batch** — batch dispatch of multiple calls
+17. **Balances accounting** — free balances update after transfers
+
+Not covered yet: a signed extrinsic driven through `TxExtension`/`Executive` end to end (nonce bump, fee charge, weight refund, block weight accounting). All tests are pallet-level dispatch.
+
+`just release-checks` is the release gate: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, then `cargo test-fast`.
