@@ -1294,4 +1294,173 @@ mod tests {
             assert_eq!(System::account_nonce(alice()), 0);
         });
     }
+
+    /// The signed-transaction extension pipeline, as the node builds it.
+    fn tx_extension(system_nonce: interface::Nonce) -> TxExtension {
+        (
+            frame_system::AuthorizeCall::<Runtime>::new(),
+            frame_system::CheckNonZeroSender::<Runtime>::new(),
+            frame_system::CheckSpecVersion::<Runtime>::new(),
+            frame_system::CheckTxVersion::<Runtime>::new(),
+            frame_system::CheckGenesis::<Runtime>::new(),
+            frame_system::CheckEra::<Runtime>::from(sp_runtime::generic::Era::Immortal),
+            frame_system::CheckNonce::<Runtime>(system_nonce),
+            frame_system::CheckWeight::<Runtime>::new(),
+            pallet_transaction_payment::ChargeTransactionPayment::<Runtime>::from(0),
+            frame_system::WeightReclaim::<Runtime>::new(),
+        )
+    }
+
+    /// Sign `call` for Alice exactly the way a client would: the payload is the
+    /// encoded `SignedPayload` (call + extension + the extension's implicit
+    /// data), blake2-hashed when it exceeds 256 bytes.
+    fn signed_extrinsic(
+        call: RuntimeCall,
+        system_nonce: interface::Nonce,
+    ) -> ExtrinsicFor<Runtime> {
+        let extension = tx_extension(system_nonce);
+        let payload = sp_runtime::generic::SignedPayload::new(call.clone(), extension.clone())
+            .expect("extension implicit data is available")
+            .encode();
+        let payload = if payload.len() > 256 {
+            sp_io::hashing::blake2_256(&payload).to_vec()
+        } else {
+            payload
+        };
+
+        let pair = Sr25519Keyring::Alice.pair();
+        let signature = sp_core::Pair::sign(&pair, &payload);
+        ExtrinsicFor::<Runtime>::new_signed(call, alice().into(), signature.into(), extension)
+    }
+
+    fn header(number: u32) -> HeaderFor<Runtime> {
+        HeaderFor::<Runtime> {
+            parent_hash: Default::default(),
+            number,
+            state_root: Default::default(),
+            extrinsics_root: Default::default(),
+            digest: Default::default(),
+        }
+    }
+
+    fn transfer_call() -> RuntimeCall {
+        RuntimeCall::Balances(pallet_balances::Call::<Runtime>::transfer_allow_death {
+            dest: bob().into(),
+            value: 1_000,
+        })
+    }
+
+    #[test]
+    fn signed_extrinsic_charges_fee_and_bumps_nonce() {
+        new_test_ext().execute_with(|| {
+            RuntimeExecutive::initialize_block(&header(System::block_number() + 1));
+
+            let initial_alice = Balances::free_balance(alice());
+            let initial_bob = Balances::free_balance(bob());
+            let uxt = signed_extrinsic(transfer_call(), 0);
+            let len = uxt.encoded_size() as u128;
+
+            assert_eq!(System::account_nonce(alice()), 0);
+            let weight_before = System::block_weight().total();
+            assert_ok!(RuntimeExecutive::apply_extrinsic(uxt));
+
+            // The nonce advanced and the transfer landed.
+            assert_eq!(System::account_nonce(alice()), 1);
+            assert_eq!(Balances::free_balance(bob()), initial_bob + 1_000);
+
+            // Weight fee is zero and the length fee is one unit per byte, so the
+            // only thing Alice pays beyond the transfer is the encoded length.
+            let paid = initial_alice - Balances::free_balance(alice()) - 1_000;
+            assert_eq!(paid, len, "expected a length-only fee of {len}");
+            assert!(paid > 0, "a signed extrinsic must not be free");
+
+            // The charged weight is the extension's own weight, plus the call,
+            // plus the per-extrinsic base weight. Only initialization weight was
+            // accounted for before `weight_before`.
+            let extension_weight = sp_runtime::traits::TransactionExtension::weight(
+                &tx_extension(0),
+                &transfer_call(),
+            );
+            let call_weight = transfer_call().get_dispatch_info().call_weight;
+            let base_extrinsic =
+                <<Runtime as frame_system::Config>::BlockWeights as frame_support::traits::Get<
+                    frame_system::limits::BlockWeights,
+                >>::get()
+                .get(frame_support::dispatch::DispatchClass::Normal)
+                .base_extrinsic;
+            assert!(extension_weight.ref_time() > 0);
+            // Ref time is exact; proof size tracks the actual storage proof of the
+            // accesses made (which can differ slightly from the declared estimate).
+            let charged = extension_weight
+                .saturating_add(call_weight)
+                .saturating_add(base_extrinsic);
+            assert_eq!(
+                System::block_weight().total().ref_time(),
+                weight_before.ref_time() + charged.ref_time()
+            );
+
+            // A real block carries the timestamp inherent; `on_finalize` panics
+            // if it was never set. The value has to fall inside the current Aura
+            // slot, and no pre-runtime seal digest was provided, so the slot is
+            // still 0 (`MILLI_SECS_PER_BLOCK / 2` is inside slot 0).
+            assert_ok!(Timestamp::set(
+                RuntimeOrigin::none(),
+                MILLI_SECS_PER_BLOCK / 2
+            ));
+            RuntimeExecutive::finalize_block();
+
+            let events = System::events();
+            assert!(events.iter().any(|record| matches!(
+                &record.event,
+                RuntimeEvent::Balances(pallet_balances::Event::Transfer {
+                    from,
+                    to,
+                    amount,
+                }) if from == &alice() && to == &bob() && amount == &1_000
+            )));
+            assert!(events.iter().any(|record| matches!(
+                &record.event,
+                RuntimeEvent::TransactionPayment(
+                    pallet_transaction_payment::Event::TransactionFeePaid { who, .. }
+                ) if who == &alice()
+            )));
+        });
+    }
+
+    #[test]
+    fn signed_extrinsic_with_wrong_nonce_is_rejected() {
+        new_test_ext().execute_with(|| {
+            RuntimeExecutive::initialize_block(&header(System::block_number() + 1));
+
+            let initial_alice = Balances::free_balance(alice());
+
+            // Signed with a future nonce: rejected before dispatch, so no state
+            // change and no fee.
+            let err = RuntimeExecutive::apply_extrinsic(signed_extrinsic(transfer_call(), 5))
+                .expect_err("a future nonce must not be accepted");
+            assert_eq!(
+                err,
+                sp_runtime::transaction_validity::TransactionValidityError::Invalid(
+                    sp_runtime::transaction_validity::InvalidTransaction::Future
+                )
+            );
+            assert_eq!(System::account_nonce(alice()), 0);
+            assert_eq!(Balances::free_balance(alice()), initial_alice);
+
+            // A stale nonce is rejected the same way once the nonce moves on.
+            assert_ok!(RuntimeExecutive::apply_extrinsic(signed_extrinsic(
+                transfer_call(),
+                0
+            )));
+            assert_eq!(System::account_nonce(alice()), 1);
+            let err = RuntimeExecutive::apply_extrinsic(signed_extrinsic(transfer_call(), 0))
+                .expect_err("a replayed nonce must not be accepted");
+            assert_eq!(
+                err,
+                sp_runtime::transaction_validity::TransactionValidityError::Invalid(
+                    sp_runtime::transaction_validity::InvalidTransaction::Stale
+                )
+            );
+        });
+    }
 }
