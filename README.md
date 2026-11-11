@@ -113,5 +113,7 @@ just build
 - To benchmark a subset, `frame-omni-bencher` takes `--pallets` and `--extrinsic` (use `"*"` for all extrinsics of the selected pallet).
 - The recipe passes `templates/runtime-weight-template.hbs`, which is runtime-specific and emits code that compiles here without post-processing. It special-cases the component parameter names of `publish_item` and `publish_revision`.
 - Generated files are written directly to `src/weights/` — currently `frame_system.rs`, `pallet_balances.rs`, `pallet_content.rs`, `pallet_account_content.rs`, `pallet_account_profile.rs`, `pallet_content_reactions.rs`, and `pallet_utility.rs`. Every one of those modules must stay listed in `src/weights/mod.rs`.
+- A run that fails **writes nothing** — `--output` is flushed only after every benchmark succeeds. If the bencher exits non-zero, `src/weights/` is untouched and the old numbers stay in place.
+- `frame_system` needs the parachain benchmark hooks in `src/lib.rs` (`frame_system_benchmarking::Config`), otherwise `set_code` and `apply_authorized_upgrade` abort with `ValidationDataNotAvailable` and take the whole run down with them. See [ARCHITECTURE.md](./ARCHITECTURE.md#parachain-hooks-for-frame_system).
 - Re-run the benchmarks after any `polkadot-sdk` bump or pallet change: measurements are toolchain- and machine-specific.
 - If upstream fixes `frame-benchmarking`'s no_std `current_time()`, the temporary auto-patch in `build.rs` becomes a no-op and can be deleted.

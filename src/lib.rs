@@ -265,8 +265,30 @@ impl pallet_utility::Config for Runtime {
     type WeightInfo = weights::pallet_utility::WeightInfo<Runtime>;
 }
 
+// Parachains cannot use `frame_system_benchmarking`'s default hooks. `System::set_code`
+// routes through `ParachainSetCode`, which schedules the upgrade via
+// `ParachainSystem::schedule_code_upgrade` instead of writing `:code` directly. That path
+// needs the `ValidationData` and `HostConfiguration` only the `set_validation_data`
+// inherent writes, and it emits `ValidationFunctionStored` instead of `CodeUpdated`
+// (`frame_system::update_code_in_storage`, the only emitter of `CodeUpdated`, is never
+// reached). With the default no-op setup, `frame_system::set_code` and
+// `frame_system::apply_authorized_upgrade` both abort with `ValidationDataNotAvailable` and
+// the whole benchmark run produces no weights.
 #[cfg(feature = "runtime-benchmarks")]
-impl frame_system_benchmarking::Config for Runtime {}
+impl frame_system_benchmarking::Config for Runtime {
+    fn setup_set_code_requirements(
+        code: &Vec<u8>,
+    ) -> Result<(), frame_benchmarking::BenchmarkError> {
+        ParachainSystem::initialize_for_set_code_benchmark(code.len() as u32);
+        Ok(())
+    }
+
+    fn verify_set_code() {
+        System::assert_last_event(
+            cumulus_pallet_parachain_system::Event::<Runtime>::ValidationFunctionStored.into(),
+        );
+    }
+}
 
 type Block = frame::runtime::types_common::BlockOf<Runtime, TxExtension>;
 type Header = HeaderFor<Runtime>;

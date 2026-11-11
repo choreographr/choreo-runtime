@@ -257,7 +257,16 @@ The patch edits the crate source in the cargo registry (`$CARGO_HOME/registry/sr
 5. The template special-cases the component parameter names of `publish_item` (three components) and `publish_revision` (two)
 6. `cargo build --release` recompiles with the generated weights as a compile check
 
-Weight measurements are machine- and toolchain-specific; regenerate after any SDK bump, pallet change, or hardware move.
+Weight measurements are machine- and toolchain-specific; regenerate after any SDK bump, pallet change, or hardware move. The committed weights were generated on 2026-11-11 with benchmark CLI 64.0.0 against `polkadot-sdk` 2609.2.0.
+
+#### Parachain hooks for `frame_system`
+
+`frame_system_benchmarking::Config` is **not** left at its defaults, and cannot be. `System::set_code` reaches `ParachainSetCode` → `ParachainSystem::schedule_code_upgrade`, which needs the `ValidationData` and `HostConfiguration` that only the `set_validation_data` inherent writes, and which emits `ValidationFunctionStored` instead of `CodeUpdated` (`frame_system::update_code_in_storage` — the sole emitter of `CodeUpdated` — is never reached on the parachain path). The runtime therefore overrides both hooks:
+
+- `setup_set_code_requirements` calls `ParachainSystem::initialize_for_set_code_benchmark(code.len())`, the `runtime-benchmarks`-gated cumulus helper that seeds both storage items
+- `verify_set_code` asserts the `ValidationFunctionStored` event instead of `CodeUpdated`
+
+With the default no-op impl, `frame_system::set_code` and `frame_system::apply_authorized_upgrade` both abort with `ValidationDataNotAvailable`, the bencher exits non-zero, and **no weights are written at all** — not even for the pallets that succeeded, because `--output` is only flushed once the whole run completes. This is why the weights shipped here measure the real parachain upgrade path (reads on `ParachainSystem::HostConfiguration` / `NewValidationCode` / `DidSetValidationCode`) rather than a solochain code write.
 
 ## Dependency Policy
 
