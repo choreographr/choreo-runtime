@@ -12,12 +12,12 @@ codec = { package = "parity-scale-codec", version = "3.7.5", default-features = 
 # `register_validate_block!` proc macro resolves this crate by name from
 # Cargo.toml (via proc-macro-crate), so the umbrella re-export alone is not
 # enough for it. Must stay on the umbrella's version or two copies appear.
-cumulus-pallet-parachain-system = { version = "0.31.0", default-features = false }
-pallet-account-content = { git = "https://github.com/choreographr/pallet-content", branch = "master", default-features = false }
-pallet-account-profile = { git = "https://github.com/choreographr/pallet-content", branch = "master", default-features = false }
-pallet-content = { git = "https://github.com/choreographr/pallet-content", branch = "master", default-features = false }
-pallet-content-reactions = { git = "https://github.com/choreographr/pallet-content", branch = "master", default-features = false }
-polkadot-sdk = { version = "2609.0.0", default-features = false, features = [
+cumulus-pallet-parachain-system = { version = "0.32.0", default-features = false }
+pallet-account-content = { git = "https://github.com/choreographr/pallet-content", tag = "polkadot-stable2609-2", default-features = false }
+pallet-account-profile = { git = "https://github.com/choreographr/pallet-content", tag = "polkadot-stable2609-2", default-features = false }
+pallet-content = { git = "https://github.com/choreographr/pallet-content", tag = "polkadot-stable2609-2", default-features = false }
+pallet-content-reactions = { git = "https://github.com/choreographr/pallet-content", tag = "polkadot-stable2609-2", default-features = false }
+polkadot-sdk = { version = "2609.2.0", default-features = false, features = [
     "runtime",
     "cumulus-pallet-aura-ext",
     "cumulus-pallet-parachain-system",
@@ -41,7 +41,7 @@ serde_json = { version = "1.0.154", default-features = false, features = ["alloc
 cumulus-test-relay-sproof-builder = "0.28.0"
 
 [build-dependencies]
-polkadot-sdk = { version = "2609.0.0", default-features = false, features = ["substrate-wasm-builder"] }
+polkadot-sdk = { version = "2609.2.0", default-features = false, features = ["substrate-wasm-builder"] }
 
 [features]
 default = ["std"]

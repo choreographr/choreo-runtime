@@ -2,7 +2,7 @@
 
 ## Overview
 
-Acuity Runtime is a **FRAME runtime** (`acuity-runtime`) written in Rust. It compiles to a Wasm blob for on-chain execution and a native `rlib` for tooling, and it is driven by `polkadot-omni-node`. The runtime uses FRAME from the Polkadot SDK, sourced as the published crates.io `polkadot-sdk` umbrella (**2609.0.0**) rather than a git tag.
+Acuity Runtime is a **FRAME runtime** (`acuity-runtime`) written in Rust. It compiles to a Wasm blob for on-chain execution and a native `rlib` for tooling, and it is driven by `polkadot-omni-node`. The runtime uses FRAME from the Polkadot SDK, sourced as the published crates.io `polkadot-sdk` umbrella (**2609.2.0**) rather than a git tag.
 
 It is wired as a **parachain**: `cumulus-pallet-parachain-system` owns the relay-chain context, the wasm exports the `validate_block` entry point, and the relay-chain inherents are part of every block. It is still a **dev-mode chain** in its economics — fees are zero on the weight axis and `Sudo` is composed in — and it has **no XCM stack yet** (see [Parachain wiring](#parachain-wiring)).
 
@@ -12,7 +12,7 @@ It is wired as a **parachain**: `cumulus-pallet-parachain-system` owns the relay
 |---|---|
 | Language | Rust (edition 2024) |
 | Toolchain | nightly, pinned in `rust-toolchain.toml` (stable via `scripts/build-stable.sh`) |
-| Framework | Polkadot SDK `polkadot-sdk` v2609.0.0 (FRAME) |
+| Framework | Polkadot SDK `polkadot-sdk` v2609.2.0 (FRAME) |
 | Encoding | Parity Scale Codec v3.7.5, scale-info v2.11.6 |
 | Serialization | serde_json v1.0.154 (genesis presets) |
 | Build | Cargo + `substrate-wasm-builder` |
@@ -226,7 +226,7 @@ Flag bits: `REVISIONABLE = 1 << 0`, `RETRACTABLE = 1 << 1`, `RETRACTED = 1 << 2`
 
 ### Build Patch
 
-`build.rs` rewrites `frame-benchmarking`'s `current_time()` to return `0u128.to_le_bytes()` under `not(feature = "std")`, which is what allows benchmark Wasm builds to succeed. The bug is still present in `frame-benchmarking 50.0.0`, the version pulled in by `polkadot-sdk 2609.0.0`.
+`build.rs` rewrites `frame-benchmarking`'s `current_time()` to return `0u128.to_le_bytes()` under `not(feature = "std")`, which is what allows benchmark Wasm builds to succeed. The bug is still present in `frame-benchmarking 50.0.0`, the version pulled in by `polkadot-sdk 2609.2.0`.
 
 The patch edits the crate source in the cargo registry (`$CARGO_HOME/registry/src/.../frame-benchmarking-*/src/utils.rs`) and in git checkouts, matching the old function body verbatim. Consequences worth knowing: the mutation is non-hermetic and persists in the shared registry cache, and it silently does nothing if upstream reflows that code. It prints a `cargo:warning=` only when it actually patches.
 
@@ -262,10 +262,10 @@ Weight measurements are machine- and toolchain-specific; regenerate after any SD
 ## Dependency Policy
 
 - `polkadot-sdk` is pinned to a single umbrella version used by both `[dependencies]` and `[build-dependencies]`.
-- The content pallets (`pallet-content`, `pallet-account-content`, `pallet-account-profile`, `pallet-content-reactions`) come from `https://github.com/choreographr/pallet-content` on `branch = "master"`, locked by `Cargo.lock` to a specific commit.
+- The content pallets (`pallet-content`, `pallet-account-content`, `pallet-account-profile`, `pallet-content-reactions`) come from `https://github.com/choreographr/pallet-content` on `tag = "polkadot-stable2609-2"` — the tag cut against `polkadot-sdk` 2609.2.0 — locked by `Cargo.lock` to the tag's commit.
 - `cumulus-pallet-parachain-system` is declared **twice**: once as an umbrella feature (for the `polkadot_sdk::cumulus_pallet_parachain_system` re-export) and once as a direct dependency, because the `register_validate_block!` proc macro resolves its own crate by name from `Cargo.toml` via `proc-macro-crate`. Both must stay on the umbrella's version.
 - `cumulus-test-relay-sproof-builder` is a dev-dependency only, used to fabricate validation data in tests.
-- **The runtime and that repo must stay on the same `polkadot-sdk` major line.** The umbrella's `frame_support` / `frame_system` / `sp_io` re-exports are feature-gated, so if the two resolve different `polkadot-sdk` versions, cargo keeps two copies and the external pallets fail with `unresolved imports ... no frame_support in the root`. Following `branch = "master"` means an upstream push can trigger this without warning; pinning to a `rev` and building with `--locked` makes it deliberate.
+- **The runtime and that repo must stay on the same `polkadot-sdk` major line.** The umbrella's `frame_support` / `frame_system` / `sp_io` re-exports are feature-gated, so if the two resolve different `polkadot-sdk` versions, cargo keeps two copies and the external pallets fail with `unresolved imports ... no frame_support in the root`. The `polkadot-stable2609-2` tag naming ties the two together: a release tag is cut on both sides, so the umbrella and the pallets move in lockstep instead of following a floating branch. Build with `--locked` to keep the tag's commit fixed.
 
 ## `no_std` Architecture
 

@@ -4,7 +4,7 @@ This repo contains a FRAME parachain runtime called `Acuity Runtime` (`acuity-ru
 
 It is wired as a parachain: `cumulus-pallet-parachain-system` owns the relay-chain context, and the built wasm exports the `validate_block` entry point that relay-chain validators call. Two things are deliberately **not** wired yet — inbound downward messages (DMP) and XCMP — so the chain drops relay-chain messages and cannot exchange cross-chain messages. See [ARCHITECTURE.md](./ARCHITECTURE.md#parachain-wiring) for exactly what that means.
 
-It targets `edition = "2024"`, uses the crates.io `polkadot-sdk` umbrella at **2609.0.0**, and builds with the **nightly** toolchain pinned in `rust-toolchain.toml` (see [ARCHITECTURE.md](./ARCHITECTURE.md) for the toolchain and stable-escape-hatch details).
+It targets `edition = "2024"`, uses the crates.io `polkadot-sdk` umbrella at **2609.2.0**, and builds with the **nightly** toolchain pinned in `rust-toolchain.toml` (see [ARCHITECTURE.md](./ARCHITECTURE.md) for the toolchain and stable-escape-hatch details).
 
 ## Build the runtime
 
@@ -80,7 +80,7 @@ just release-checks     # fmt --check, then clippy -D warnings, then test-fast
 
 This repository includes runtime benchmarking wiring: the `runtime-benchmarks` feature, the `frame_benchmarking::Benchmark` runtime API implementation, and entries in `define_benchmarks!` for `frame_system`, `pallet_balances`, `pallet_content`, `pallet_account_content`, `pallet_account_profile`, `pallet_content_reactions`, and `pallet_utility`.
 
-The upstream `frame-benchmarking` no-std bug is still present in the crate shipped with `polkadot-sdk 2609.0.0` (`frame-benchmarking 50.0.0`): its `current_time()` calls `std::time::SystemTime` unconditionally, which breaks Wasm benchmark builds. `build.rs` patches that function in the cargo registry source automatically before invoking `substrate-wasm-builder`, so no manual machine-local patching is required.
+The upstream `frame-benchmarking` no-std bug is still present in the crate shipped with `polkadot-sdk 2609.2.0` (`frame-benchmarking 50.0.0`): its `current_time()` calls `std::time::SystemTime` unconditionally, which breaks Wasm benchmark builds. `build.rs` patches that function in the cargo registry source automatically before invoking `substrate-wasm-builder`, so no manual machine-local patching is required.
 
 ### Expected benchmarking workflow
 
