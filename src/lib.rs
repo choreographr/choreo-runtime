@@ -488,9 +488,10 @@ impl pallet_collator_selection::Config for Runtime {
     // Root (and therefore the root/general_admin tracks) manages the collator set.
     type UpdateOrigin = frame_system::EnsureRoot<AccountId>;
     type PotId = PotId;
-    // Invulnerables-only: public candidacy is disabled (`MaxCandidates = 0`).
-    // Enable candidacy by raising this and lowering `MinEligibleCollators`.
-    type MaxCandidates = ConstU32<0>;
+    // Permissionless candidacy: anyone may register as a collator by bonding
+    // `CandidacyBond`, subject to `DesiredCandidates`. The bond itself is a
+    // genesis value (adjustable later via `set_candidacy_bond`).
+    type MaxCandidates = ConstU32<100>;
     type MinEligibleCollators = ConstU32<1>;
     type MaxInvulnerables = ConstU32<10>;
     // Must be a multiple of the session length or the set drifts out of sync.
@@ -498,7 +499,7 @@ impl pallet_collator_selection::Config for Runtime {
     type ValidatorId = <Self as frame_system::Config>::AccountId;
     type ValidatorIdOf = pallet_collator_selection::IdentityCollator;
     type ValidatorRegistration = Session;
-    type WeightInfo = pallet_collator_selection::weights::SubstrateWeight<Runtime>;
+    type WeightInfo = weights::pallet_collator_selection::WeightInfo<Runtime>;
 }
 
 /// Session benchmarks need to mint a session key and prove ownership of it.

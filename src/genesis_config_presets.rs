@@ -43,7 +43,9 @@ pub fn development_config_genesis() -> Value {
         },
         collator_selection: CollatorSelectionConfig {
             invulnerables: vec![alice.clone()],
-            candidacy_bond: 0,
+            // Placeholder bond: 1,000 CHOR. Benchmarking requires a non-zero
+            // bond; the production value is a governance decision.
+            candidacy_bond: 1_000 * UNITS,
             desired_candidates: 0,
         },
         parachain_info: ParachainInfoConfig {
