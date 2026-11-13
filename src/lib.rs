@@ -1,4 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+// `frame_construct_runtime!` recurses deeply with this many pallets.
+#![recursion_limit = "1024"]
 
 #[cfg(feature = "std")]
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
@@ -6,6 +8,7 @@ include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 extern crate alloc;
 
 use alloc::vec::Vec;
+use cumulus_primitives_core::{AggregateMessageOrigin, ParaId};
 use frame_support::weights::ConstantMultiplier;
 use pallet_transaction_payment::{FeeDetails, RuntimeDispatchInfo};
 use polkadot_sdk::{
@@ -14,63 +17,32 @@ use polkadot_sdk::{
         deps::sp_genesis_builder,
         runtime::{apis, prelude::*},
     },
-    staging_parachain_info as parachain_info, *,
+    staging_parachain_info as parachain_info,
+    staging_xcm::latest::prelude::AssetId,
+    *,
 };
 use sp_session::OpaqueGeneratedSessionKeys;
 
-pub mod genesis_config_presets {
-    use super::*;
-    use crate::{BalancesConfig, ParachainInfoConfig, RuntimeGenesisConfig, SudoConfig};
-    use alloc::vec;
-    use cumulus_primitives_core::ParaId;
-    use serde_json::Value;
-    use sp_consensus_aura::sr25519::AuthorityId as AuraId;
-    use sp_keyring::Sr25519Keyring;
-
-    fn dev_authority() -> AuraId {
-        Sr25519Keyring::Alice.public().into()
-    }
-
-    pub fn development_config_genesis() -> Value {
-        frame_support::build_struct_json_patch!(RuntimeGenesisConfig {
-            balances: BalancesConfig {
-                balances: vec![
-                    (Sr25519Keyring::Alice.to_account_id(), 1_000_000_000_000_000),
-                    (Sr25519Keyring::Bob.to_account_id(), 1_000_000_000_000_000),
-                ]
-            },
-            aura: pallet_aura::GenesisConfig {
-                authorities: vec![dev_authority()],
-            },
-            parachain_info: ParachainInfoConfig {
-                parachain_id: ParaId::new(1000),
-            },
-            sudo: SudoConfig {
-                key: Some(Sr25519Keyring::Alice.to_account_id()),
-            },
-        })
-    }
-
-    pub fn get_preset(id: &PresetId) -> Option<Vec<u8>> {
-        let patch = match id.as_ref() {
-            sp_genesis_builder::DEV_RUNTIME_PRESET => development_config_genesis(),
-            _ => return None,
-        };
-
-        Some(serde_json::to_string(&patch).ok()?.into_bytes())
-    }
-
-    pub fn preset_names() -> Vec<PresetId> {
-        alloc::vec![PresetId::from(sp_genesis_builder::DEV_RUNTIME_PRESET)]
-    }
-}
-
+pub mod genesis_config_presets;
+pub mod governance;
 pub mod weights;
+pub mod xcm_config;
+
+// Primitive aliases, re-exported so submodules can `use crate::…`. These must
+// stay identical to what `frame_system::config_preludes::ParaChainDefaultConfig`
+// would pick, and are restated explicitly below so the runtime does not depend
+// on a prelude's defaults.
+pub type AccountId = sp_runtime::AccountId32;
+pub type Signature = sp_runtime::MultiSignature;
+pub type Balance = u128;
+pub type Nonce = u32;
+pub type BlockNumber = u32;
+pub type Hash = sp_core::H256;
 
 #[runtime_version]
 pub const VERSION: RuntimeVersion = RuntimeVersion {
-    spec_name: alloc::borrow::Cow::Borrowed("acuity-runtime"),
-    impl_name: alloc::borrow::Cow::Borrowed("acuity-runtime"),
+    spec_name: alloc::borrow::Cow::Borrowed("choreographr-runtime"),
+    impl_name: alloc::borrow::Cow::Borrowed("choreographr-runtime"),
     authoring_version: 1,
     spec_version: 1,
     impl_version: 1,
@@ -79,20 +51,115 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
     system_version: 1,
 };
 
-type TxExtension = (
-    frame_system::AuthorizeCall<Runtime>,
-    frame_system::CheckNonZeroSender<Runtime>,
-    frame_system::CheckSpecVersion<Runtime>,
-    frame_system::CheckTxVersion<Runtime>,
-    frame_system::CheckGenesis<Runtime>,
-    frame_system::CheckEra<Runtime>,
-    frame_system::CheckNonce<Runtime>,
-    frame_system::CheckWeight<Runtime>,
-    pallet_transaction_payment::ChargeTransactionPayment<Runtime>,
-    frame_system::WeightReclaim<Runtime>,
+// --- timing -------------------------------------------------------------------
+
+pub const MILLI_SECS_PER_BLOCK: u64 = 6000;
+pub const SLOT_DURATION: u64 = MILLI_SECS_PER_BLOCK;
+
+pub const MINUTES: BlockNumber = 60_000 / (MILLI_SECS_PER_BLOCK as BlockNumber);
+pub const HOURS: BlockNumber = MINUTES * 60;
+pub const DAYS: BlockNumber = HOURS * 24;
+
+// --- denominations ------------------------------------------------------------
+//
+// CHOR carries 18 decimals: that preserves the ACU ledger's raw integers, so the
+// 1:1 balance snapshot needs no rescaling, and it matches the ERC-20 convention
+// for any future bridged representation.
+
+pub const UNITS: Balance = 1_000_000_000_000_000_000;
+pub const CENTS: Balance = UNITS / 100;
+pub const MILLI_UNIT: Balance = 1_000_000_000_000_000;
+pub const MICRO_UNIT: Balance = 1_000_000_000_000;
+
+/// Existential deposit: 0.01 CHOR.
+pub const EXISTENTIAL_DEPOSIT: Balance = 10 * MILLI_UNIT;
+
+/// Fee per unit of `ref_time` weight: 0.000000000001 CHOR.
+pub const WEIGHT_FEE_MULTIPLIER: Balance = 1_000_000;
+
+parameter_types! {
+    /// Fee per byte of extrinsic length: 0.00001 CHOR.
+    pub const TransactionByteFee: Balance = 10 * MICRO_UNIT;
+}
+
+/// Convert weight into a fee. A linear mapping keeps fees predictable; swap in a
+/// polynomial if the chain ever needs to price congestion.
+pub type WeightToFee = ConstantMultiplier<Balance, ConstU128<WEIGHT_FEE_MULTIPLIER>>;
+
+// --- consensus / block limits -------------------------------------------------
+
+/// Async-backing parameters. These must not exceed the target relay chain's
+/// `async_backing_params` (`max_candidate_depth` = 3, `allowed_ancestry_len` = 2
+/// on Polkadot).
+pub(crate) const UNINCLUDED_SEGMENT_CAPACITY: u32 = 3;
+pub(crate) const BLOCK_PROCESSING_VELOCITY: u32 = 1;
+pub(crate) const RELAY_CHAIN_SLOT_DURATION_MILLIS: u32 = 6000;
+
+pub type ConsensusHook = cumulus_pallet_aura_ext::FixedVelocityConsensusHook<
+    Runtime,
+    RELAY_CHAIN_SLOT_DURATION_MILLIS,
+    BLOCK_PROCESSING_VELOCITY,
+    UNINCLUDED_SEGMENT_CAPACITY,
+>;
+
+/// ~5% of block weight is assumed to be consumed by `on_initialize`.
+const AVERAGE_ON_INITIALIZE_RATIO: Perbill = Perbill::from_percent(5);
+/// `Normal` extrinsics may fill 75% of the block; the rest is operational space.
+const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
+
+/// Two seconds of compute at a six-second block time.
+const MAXIMUM_BLOCK_WEIGHT: Weight = Weight::from_parts(
+    frame_support::weights::constants::WEIGHT_REF_TIME_PER_SECOND.saturating_mul(2),
+    cumulus_primitives_core::relay_chain::MAX_POV_SIZE as u64,
 );
 
-const MILLI_SECS_PER_BLOCK: u64 = 6000;
+parameter_types! {
+    pub const SS58PrefixValue: u16 = 76;
+    pub RuntimeBlockLength: frame_system::limits::BlockLength =
+        frame_system::limits::BlockLength::builder()
+            .max_length(5 * 1024 * 1024)
+            .modify_max_length_for_class(DispatchClass::Normal, |m| {
+                *m = NORMAL_DISPATCH_RATIO * *m
+            })
+            .build();
+    pub RuntimeBlockWeights: frame_system::limits::BlockWeights =
+        frame_system::limits::BlockWeights::builder()
+            .base_block(frame_support::weights::constants::BlockExecutionWeight::get())
+            .for_class(DispatchClass::all(), |weights| {
+                weights.base_extrinsic =
+                    frame_support::weights::constants::ExtrinsicBaseWeight::get();
+            })
+            .for_class(DispatchClass::Normal, |weights| {
+                weights.max_total = Some(NORMAL_DISPATCH_RATIO * MAXIMUM_BLOCK_WEIGHT);
+            })
+            .for_class(DispatchClass::Operational, |weights| {
+                weights.max_total = Some(MAXIMUM_BLOCK_WEIGHT);
+                weights.reserved =
+                    Some(MAXIMUM_BLOCK_WEIGHT - NORMAL_DISPATCH_RATIO * MAXIMUM_BLOCK_WEIGHT);
+            })
+            .avg_block_initialization(AVERAGE_ON_INITIALIZE_RATIO)
+            .build_or_panic();
+}
+
+/// No runtime-wide migrations yet. Add `OnRuntimeUpgrade` items here as the
+/// runtime evolves \u2014 notably the `ParachainInfo` rewrite needed when this chain
+/// moves from its own relay chain onto Polkadot.
+type SingleBlockMigrations = ();
+
+pub type TxExtension = cumulus_pallet_weight_reclaim::StorageWeightReclaim<
+    Runtime,
+    (
+        frame_system::AuthorizeCall<Runtime>,
+        frame_system::CheckNonZeroSender<Runtime>,
+        frame_system::CheckSpecVersion<Runtime>,
+        frame_system::CheckTxVersion<Runtime>,
+        frame_system::CheckGenesis<Runtime>,
+        frame_system::CheckEra<Runtime>,
+        frame_system::CheckNonce<Runtime>,
+        frame_system::CheckWeight<Runtime>,
+        pallet_transaction_payment::ChargeTransactionPayment<Runtime>,
+    ),
+>;
 
 #[frame_construct_runtime]
 mod runtime {
@@ -152,6 +219,57 @@ mod runtime {
 
     #[runtime::pallet_index(13)]
     pub type Utility = pallet_utility::Pallet<Runtime>;
+
+    // --- collator / consensus ------------------------------------------------
+
+    #[runtime::pallet_index(14)]
+    pub type Authorship = pallet_authorship::Pallet<Runtime>;
+
+    #[runtime::pallet_index(15)]
+    pub type Session = pallet_session::Pallet<Runtime>;
+
+    #[runtime::pallet_index(16)]
+    pub type CollatorSelection = pallet_collator_selection::Pallet<Runtime>;
+
+    #[runtime::pallet_index(17)]
+    pub type WeightReclaim = cumulus_pallet_weight_reclaim::Pallet<Runtime>;
+
+    // --- xcm -----------------------------------------------------------------
+
+    #[runtime::pallet_index(18)]
+    pub type XcmpQueue = cumulus_pallet_xcmp_queue::Pallet<Runtime>;
+
+    #[runtime::pallet_index(19)]
+    pub type PolkadotXcm = pallet_xcm::Pallet<Runtime>;
+
+    #[runtime::pallet_index(20)]
+    pub type CumulusXcm = cumulus_pallet_xcm::Pallet<Runtime>;
+
+    #[runtime::pallet_index(21)]
+    pub type MessageQueue = pallet_message_queue::Pallet<Runtime>;
+
+    // --- governance ----------------------------------------------------------
+
+    #[runtime::pallet_index(22)]
+    pub type Preimage = pallet_preimage::Pallet<Runtime>;
+
+    #[runtime::pallet_index(23)]
+    pub type Scheduler = pallet_scheduler::Pallet<Runtime>;
+
+    #[runtime::pallet_index(24)]
+    pub type Referenda = pallet_referenda::Pallet<Runtime>;
+
+    #[runtime::pallet_index(25)]
+    pub type ConvictionVoting = pallet_conviction_voting::Pallet<Runtime>;
+
+    #[runtime::pallet_index(26)]
+    pub type Whitelist = pallet_whitelist::Pallet<Runtime>;
+
+    #[runtime::pallet_index(27)]
+    pub type Treasury = pallet_treasury::Pallet<Runtime>;
+
+    #[runtime::pallet_index(28)]
+    pub type Origins = governance::custom_origins::Pallet<Runtime>;
 }
 
 parameter_types! {
@@ -162,61 +280,114 @@ parameter_types! {
     pub const MaxMentions: u32 = 256;
     pub const MaxItemsPerAccount: u32 = 1024;
     pub const MaxEmojis: u32 = 16;
-    /// Messages from the relay chain are dropped for now: no DMP queue is
-    /// wired, so this reserves no block weight for processing them.
-    pub const ReservedDmpWeight: Weight = Weight::zero();
-    /// Same for XCMP: there is no XCMP queue pallet, so nothing is reserved.
-    pub const ReservedXcmpWeight: Weight = Weight::zero();
+
+    /// Weight reserved for processing downward messages from the relay chain.
+    pub const ReservedDmpWeight: Weight = MAXIMUM_BLOCK_WEIGHT.saturating_div(4);
+    /// Weight reserved for processing sibling (XCMP/HRMP) messages.
+    pub const ReservedXcmpWeight: Weight = MAXIMUM_BLOCK_WEIGHT.saturating_div(4);
+    pub const RelayOrigin: AggregateMessageOrigin = AggregateMessageOrigin::Parent;
+
+    pub MessageQueueServiceWeight: Weight = Perbill::from_percent(35) * RuntimeBlockWeights::get().max_block;
+
+    /// The asset used to pay message delivery fees to the relay chain.
+    pub FeeAssetId: AssetId = AssetId(xcm_config::RelayLocation::get());
+    pub const ToSiblingBaseDeliveryFee: u128 = 3 * CENTS;
+    pub const ToParentBaseDeliveryFee: u128 = 3 * CENTS;
 }
+
+/// Price for delivering XCM to a sibling parachain (e.g. Hydration).
+pub type PriceForSiblingParachainDelivery =
+    polkadot_runtime_common::xcm_sender::ExponentialPrice<
+        FeeAssetId,
+        ToSiblingBaseDeliveryFee,
+        TransactionByteFee,
+        XcmpQueue,
+    >;
+
+/// Price for delivering XCM up to the relay chain.
+pub type PriceForParentDelivery = polkadot_runtime_common::xcm_sender::ExponentialPrice<
+    FeeAssetId,
+    ToParentBaseDeliveryFee,
+    TransactionByteFee,
+    ParachainSystem,
+>;
 
 #[derive_impl(frame_system::config_preludes::ParaChainDefaultConfig)]
 impl frame_system::Config for Runtime {
+    type AccountId = AccountId;
+    type Nonce = Nonce;
+    type Hash = Hash;
     type Block = Block;
     type Version = Version;
     type AccountData = pallet_balances::AccountData<<Runtime as pallet_balances::Config>::Balance>;
     type SystemWeightInfo = weights::frame_system::WeightInfo<Runtime>;
     type OnSetCode = cumulus_pallet_parachain_system::ParachainSetCode<Runtime>;
+    type BlockWeights = RuntimeBlockWeights;
+    type BlockLength = RuntimeBlockLength;
+    type SS58Prefix = SS58PrefixValue;
+    type SingleBlockMigrations = SingleBlockMigrations;
+}
+
+impl cumulus_pallet_weight_reclaim::Config for Runtime {
+    type WeightInfo = ();
 }
 
 impl cumulus_pallet_parachain_system::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
     type OnSystemEvent = ();
     type SelfParaId = ParachainInfo;
-    type OutboundXcmpMessageSource = ();
-    type DmpQueue = ();
+    type OutboundXcmpMessageSource = XcmpQueue;
+    type DmpQueue = frame_support::traits::EnqueueWithOrigin<MessageQueue, RelayOrigin>;
     type ReservedDmpWeight = ReservedDmpWeight;
-    type XcmpMessageHandler = ();
+    type XcmpMessageHandler = XcmpQueue;
     type ReservedXcmpWeight = ReservedXcmpWeight;
     type CheckAssociatedRelayNumber =
         cumulus_pallet_parachain_system::RelayNumberMonotonicallyIncreases;
-    type ConsensusHook = cumulus_pallet_parachain_system::consensus_hook::RequireParentIncluded;
+    type ConsensusHook = ConsensusHook;
     type WeightInfo = ();
     type RelayParentOffset = ConstU32<0>;
     type SchedulingSignatureVerifier = ();
 }
 
-#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+parameter_types! {
+    pub const ExistentialDeposit: Balance = EXISTENTIAL_DEPOSIT;
+}
+
 impl pallet_balances::Config for Runtime {
-    type Balance = u128;
-    type ExistentialDeposit = ConstU128<1>;
+    type Balance = Balance;
+    type RuntimeEvent = RuntimeEvent;
+    type DustRemoval = ();
+    type ExistentialDeposit = ExistentialDeposit;
     type AccountStore = System;
     type WeightInfo = weights::pallet_balances::WeightInfo<Runtime>;
+    type MaxLocks = ConstU32<50>;
+    type MaxReserves = ConstU32<50>;
+    type ReserveIdentifier = [u8; 8];
+    type RuntimeHoldReason = RuntimeHoldReason;
+    type RuntimeFreezeReason = RuntimeFreezeReason;
+    type FreezeIdentifier = RuntimeFreezeReason;
+    type MaxFreezes = frame_support::traits::VariantCountOf<RuntimeFreezeReason>;
+    type DoneSlashHandler = ();
 }
 
 impl pallet_aura::Config for Runtime {
     type AuthorityId = sp_consensus_aura::sr25519::AuthorityId;
     type DisabledValidators = ();
     type MaxAuthorities = ConstU32<32>;
-    type AllowMultipleBlocksPerSlot = ConstBool<false>;
-    type SlotDuration = pallet_aura::MinimumPeriodTimesTwo<Runtime>;
+    // Async backing may author more than one block per relay slot.
+    type AllowMultipleBlocksPerSlot = ConstBool<true>;
+    type SlotDuration = ConstU64<SLOT_DURATION>;
 }
 
 impl parachain_info::Config for Runtime {}
 
 impl cumulus_pallet_aura_ext::Config for Runtime {}
 
-#[derive_impl(pallet_sudo::config_preludes::TestDefaultConfig)]
-impl pallet_sudo::Config for Runtime {}
+impl pallet_sudo::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type RuntimeCall = RuntimeCall;
+    type WeightInfo = ();
+}
 
 impl pallet_timestamp::Config for Runtime {
     type Moment = u64;
@@ -225,11 +396,13 @@ impl pallet_timestamp::Config for Runtime {
     type WeightInfo = pallet_timestamp::weights::SubstrateWeight<Runtime>;
 }
 
-#[derive_impl(pallet_transaction_payment::config_preludes::TestDefaultConfig)]
 impl pallet_transaction_payment::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
     type OnChargeTransaction = pallet_transaction_payment::FungibleAdapter<Balances, ()>;
-    type WeightToFee = NoFee<<Self as pallet_balances::Config>::Balance>;
-    type LengthToFee = ConstantMultiplier<<Self as pallet_balances::Config>::Balance, ConstU128<1>>;
+    type WeightToFee = WeightToFee;
+    type LengthToFee = ConstantMultiplier<Balance, TransactionByteFee>;
+    type FeeMultiplierUpdate = polkadot_runtime_common::SlowAdjustingFeeUpdate<Runtime>;
+    type OperationalFeeMultiplier = ConstU8<5>;
     type WeightInfo = pallet_transaction_payment::weights::SubstrateWeight<Runtime>;
 }
 
@@ -263,6 +436,108 @@ impl pallet_utility::Config for Runtime {
     type RuntimeCall = RuntimeCall;
     type PalletsOrigin = OriginCaller;
     type WeightInfo = weights::pallet_utility::WeightInfo<Runtime>;
+}
+
+// --- collators ----------------------------------------------------------------
+
+impl pallet_authorship::Config for Runtime {
+    type FindAuthor = pallet_session::FindAccountFromAuthorIndex<Self, Aura>;
+    type EventHandler = (CollatorSelection,);
+}
+
+polkadot_sdk::sp_runtime::impl_opaque_keys! {
+    pub struct SessionKeys {
+        pub aura: Aura,
+    }
+}
+
+parameter_types! {
+    pub const Period: BlockNumber = 6 * HOURS;
+    pub const Offset: BlockNumber = 0;
+    pub const PotId: PalletId = PalletId(*b"chor/pot");
+    pub const CollatorSessionLength: BlockNumber = 6 * HOURS;
+}
+
+impl pallet_session::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type ValidatorId = <Self as frame_system::Config>::AccountId;
+    // Collators serve as their own stash/controller pair.
+    type ValidatorIdOf = pallet_collator_selection::IdentityCollator;
+    type ShouldEndSession = pallet_session::PeriodicSessions<Period, Offset>;
+    type NextSessionRotation = pallet_session::PeriodicSessions<Period, Offset>;
+    type SessionManager = CollatorSelection;
+    type SessionHandler = <SessionKeys as sp_runtime::traits::OpaqueKeys>::KeyTypeIdProviders;
+    type Keys = SessionKeys;
+    type DisablingStrategy = ();
+    type Currency = Balances;
+    type KeyDeposit = ();
+    type WeightInfo = pallet_session::weights::SubstrateWeight<Runtime>;
+}
+
+impl pallet_collator_selection::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+    // Root (and therefore the root/general_admin tracks) manages the collator set.
+    type UpdateOrigin = frame_system::EnsureRoot<AccountId>;
+    type PotId = PotId;
+    // Invulnerables-only: public candidacy is disabled (`MaxCandidates = 0`).
+    // Enable candidacy by raising this and lowering `MinEligibleCollators`.
+    type MaxCandidates = ConstU32<0>;
+    type MinEligibleCollators = ConstU32<1>;
+    type MaxInvulnerables = ConstU32<10>;
+    // Must be a multiple of the session length or the set drifts out of sync.
+    type KickThreshold = Period;
+    type ValidatorId = <Self as frame_system::Config>::AccountId;
+    type ValidatorIdOf = pallet_collator_selection::IdentityCollator;
+    type ValidatorRegistration = Session;
+    type WeightInfo = pallet_collator_selection::weights::SubstrateWeight<Runtime>;
+}
+
+// --- message queues / xcmp -----------------------------------------------------
+
+impl pallet_message_queue::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    #[cfg(feature = "runtime-benchmarks")]
+    type MessageProcessor = pallet_message_queue::mock_helpers::NoopMessageProcessor<
+        AggregateMessageOrigin,
+    >;
+    #[cfg(not(feature = "runtime-benchmarks"))]
+    type MessageProcessor = polkadot_sdk::staging_xcm_builder::ProcessXcmMessage<
+        AggregateMessageOrigin,
+        polkadot_sdk::staging_xcm_executor::XcmExecutor<xcm_config::XcmConfig>,
+        RuntimeCall,
+    >;
+    type Size = u32;
+    // The queue only ever sees `Sibling(ParaId)` origins from XCMP.
+    type QueueChangeHandler =
+        parachains_common::message_queue::NarrowOriginToSibling<XcmpQueue>;
+    type QueuePausedQuery =
+        parachains_common::message_queue::NarrowOriginToSibling<XcmpQueue>;
+    type HeapSize = ConstU32<{ 103 * 1024 }>;
+    type MaxStale = ConstU32<8>;
+    type ServiceWeight = MessageQueueServiceWeight;
+    type IdleMaxServiceWeight = ();
+    type WeightInfo = pallet_message_queue::weights::SubstrateWeight<Runtime>;
+}
+
+impl cumulus_pallet_xcmp_queue::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type ChannelInfo = ParachainSystem;
+    type VersionWrapper = ();
+    // Enqueue sibling messages into the shared message queue.
+    type XcmpQueue = frame_support::traits::TransformOrigin<
+        MessageQueue,
+        AggregateMessageOrigin,
+        ParaId,
+        parachains_common::message_queue::ParaIdToSibling,
+    >;
+    type MaxInboundSuspended = ConstU32<1_000>;
+    type MaxActiveOutboundChannels = ConstU32<128>;
+    type MaxPageSize = ConstU32<{ 1 << 16 }>;
+    type ControllerOrigin = frame_system::EnsureRoot<AccountId>;
+    type ControllerOriginConverter = xcm_config::XcmOriginToTransactDispatchOrigin;
+    type PriceForSiblingDelivery = PriceForSiblingParachainDelivery;
+    type WeightInfo = cumulus_pallet_xcmp_queue::weights::SubstrateWeight<Runtime>;
 }
 
 // Parachains cannot use `frame_system_benchmarking`'s default hooks. `System::set_code`
@@ -308,7 +583,10 @@ mod benches {
         [pallet_balances, Balances]
         [pallet_content, Content]
         [pallet_content_reactions, ContentReactions]
+        [pallet_message_queue, MessageQueue]
+        [pallet_timestamp, Timestamp]
         [pallet_utility, Utility]
+        [cumulus_pallet_xcmp_queue, XcmpQueue]
     );
 
     pub fn benchmark_metadata(
@@ -399,12 +677,15 @@ impl_runtime_apis! {
     }
 
     impl apis::SessionKeys<Block> for Runtime {
-        fn generate_session_keys(_: Vec<u8>, _: Option<Vec<u8>>) -> OpaqueGeneratedSessionKeys {
-            Default::default()
+        fn generate_session_keys(
+            owner: Vec<u8>,
+            seed: Option<Vec<u8>>,
+        ) -> OpaqueGeneratedSessionKeys {
+            SessionKeys::generate(&owner, seed).into()
         }
 
-        fn decode_session_keys(_: Vec<u8>) -> Option<Vec<(Vec<u8>, apis::KeyTypeId)>> {
-            Default::default()
+        fn decode_session_keys(encoded: Vec<u8>) -> Option<Vec<(Vec<u8>, apis::KeyTypeId)>> {
+            SessionKeys::decode_into_raw_public_keys(&encoded)
         }
     }
 
@@ -545,9 +826,9 @@ mod tests {
         RuntimeGenesisConfig {
             balances: BalancesConfig {
                 balances: vec![
-                    (alice(), 1_000_000_000_000_000),
-                    (bob(), 1_000_000_000_000_000),
-                    (charlie(), 1_000_000_000_000_000),
+                    (alice(), 1_000_000 * UNITS),
+                    (bob(), 1_000_000 * UNITS),
+                    (charlie(), 1_000_000 * UNITS),
                 ],
                 dev_accounts: None,
             },
@@ -611,11 +892,11 @@ mod tests {
             Value::Array(vec![
                 Value::Array(vec![
                     Value::String(alice().to_ss58check()),
-                    Value::Number(1_000_000_000_000_000u64.into()),
+                    Value::Number(10_000_000_000_000_000_000u64.into()),
                 ]),
                 Value::Array(vec![
                     Value::String(bob().to_ss58check()),
-                    Value::Number(1_000_000_000_000_000u64.into()),
+                    Value::Number(10_000_000_000_000_000_000u64.into()),
                 ]),
             ])
         );
@@ -653,8 +934,8 @@ mod tests {
 
     #[test]
     fn runtime_version_is_consistent() {
-        assert_eq!(VERSION.spec_name.as_ref(), "acuity-runtime");
-        assert_eq!(VERSION.impl_name.as_ref(), "acuity-runtime");
+        assert_eq!(VERSION.spec_name.as_ref(), "choreographr-runtime");
+        assert_eq!(VERSION.impl_name.as_ref(), "choreographr-runtime");
         assert_eq!(VERSION.spec_version, 1);
         assert_eq!(VERSION.transaction_version, 1);
         assert_eq!(VERSION.apis.len(), RUNTIME_API_VERSIONS.len());
@@ -690,15 +971,18 @@ mod tests {
     }
 
     #[test]
-    fn transaction_payment_uses_zero_weight_fee_and_linear_length_fee() {
+    fn transaction_payment_uses_weight_and_length_fees() {
         new_test_ext().execute_with(|| {
+            // Linear weight fee: ref_time * WEIGHT_FEE_MULTIPLIER.
             assert_eq!(
-                TransactionPayment::weight_to_fee(Weight::from_parts(999, 0)),
-                0
+                TransactionPayment::weight_to_fee(Weight::from_parts(1_000, 0)),
+                1_000 * WEIGHT_FEE_MULTIPLIER
             );
-            assert_eq!(TransactionPayment::length_to_fee(1), 1);
-            assert_eq!(TransactionPayment::length_to_fee(7), 7);
-            assert_eq!(TransactionPayment::length_to_fee(1024), 1024);
+            // Linear length fee: bytes * TransactionByteFee.
+            let byte_fee = TransactionByteFee::get();
+            assert_eq!(TransactionPayment::length_to_fee(1), byte_fee);
+            assert_eq!(TransactionPayment::length_to_fee(7), 7 * byte_fee);
+            assert_eq!(TransactionPayment::length_to_fee(1024), 1024 * byte_fee);
         });
     }
 
@@ -910,7 +1194,7 @@ mod tests {
     fn balances_transfer_and_existential_deposit() {
         new_test_ext().execute_with(|| {
             let initial = Balances::free_balance(alice());
-            assert_eq!(initial, 1_000_000_000_000_000);
+            assert_eq!(initial, 1_000_000 * UNITS);
 
             assert_ok!(Balances::transfer_allow_death(
                 RuntimeOrigin::signed(alice()),
@@ -918,25 +1202,34 @@ mod tests {
                 500,
             ));
             assert_eq!(Balances::free_balance(alice()), initial - 500);
-            assert_eq!(Balances::free_balance(bob()), 1_000_000_000_000_000 + 500);
+            assert_eq!(Balances::free_balance(bob()), 1_000_000 * UNITS + 500);
 
-            assert_eq!(Balances::free_balance(charlie()), 1_000_000_000_000_000);
+            assert_eq!(Balances::free_balance(charlie()), 1_000_000 * UNITS);
             assert_noop!(
                 Balances::transfer_allow_death(
                     RuntimeOrigin::signed(charlie()),
                     alice().into(),
-                    1_000_000_000_000_001,
+                    1_000_000 * UNITS + 1,
                 ),
                 DispatchError::Token(TokenError::FundsUnavailable)
             );
 
             let new_account: AccountId = sp_runtime::AccountId32::from([0x42u8; 32]);
+            // Below the existential deposit: a new account cannot be created.
+            assert_noop!(
+                Balances::transfer_allow_death(
+                    RuntimeOrigin::signed(alice()),
+                    new_account.clone().into(),
+                    EXISTENTIAL_DEPOSIT - 1,
+                ),
+                DispatchError::Token(TokenError::BelowMinimum)
+            );
             assert_ok!(Balances::transfer_allow_death(
                 RuntimeOrigin::signed(alice()),
                 new_account.clone().into(),
-                1,
+                EXISTENTIAL_DEPOSIT,
             ));
-            assert_eq!(Balances::free_balance(new_account), 1);
+            assert_eq!(Balances::free_balance(new_account), EXISTENTIAL_DEPOSIT);
         });
     }
 
@@ -1358,7 +1651,7 @@ mod tests {
 
     /// The signed-transaction extension pipeline, as the node builds it.
     fn tx_extension(system_nonce: interface::Nonce) -> TxExtension {
-        (
+        TxExtension::new((
             frame_system::AuthorizeCall::<Runtime>::new(),
             frame_system::CheckNonZeroSender::<Runtime>::new(),
             frame_system::CheckSpecVersion::<Runtime>::new(),
@@ -1368,8 +1661,7 @@ mod tests {
             frame_system::CheckNonce::<Runtime>(system_nonce),
             frame_system::CheckWeight::<Runtime>::new(),
             pallet_transaction_payment::ChargeTransactionPayment::<Runtime>::from(0),
-            frame_system::WeightReclaim::<Runtime>::new(),
-        )
+        ))
     }
 
     /// Sign `call` for Alice exactly the way a client would: the payload is the
@@ -1479,11 +1771,14 @@ mod tests {
             assert_eq!(System::account_nonce(alice()), 1);
             assert_eq!(Balances::free_balance(bob()), initial_bob + 1_000);
 
-            // Weight fee is zero and the length fee is one unit per byte, so the
-            // only thing Alice pays beyond the transfer is the encoded length.
+            // Fees are charged on both weight and length.
             let paid = initial_alice - Balances::free_balance(alice()) - 1_000;
-            assert_eq!(paid, len, "expected a length-only fee of {len}");
             assert!(paid > 0, "a signed extrinsic must not be free");
+            let length_only = TransactionPayment::length_to_fee(len as u32);
+            assert!(
+                paid > length_only,
+                "expected a weight component on top of the {length_only} length fee, paid {paid}"
+            );
 
             // The charged weight is the extension's own weight, plus the call,
             // plus the per-extrinsic base weight. Only initialization weight was

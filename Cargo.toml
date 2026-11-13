@@ -19,18 +19,45 @@ pallet-content = { git = "https://github.com/choreographr/pallet-content", tag =
 pallet-content-reactions = { git = "https://github.com/choreographr/pallet-content", tag = "polkadot-stable2609-2", default-features = false }
 polkadot-sdk = { version = "2609.2.0", default-features = false, features = [
     "runtime",
+    # parachain plumbing
     "cumulus-pallet-aura-ext",
     "cumulus-pallet-parachain-system",
+    "cumulus-pallet-weight-reclaim",
+    "cumulus-pallet-xcm",
+    "cumulus-pallet-xcmp-queue",
     "cumulus-primitives-core",
     "cumulus-primitives-parachain-inherent",
+    "cumulus-primitives-utility",
+    "parachains-common",
+    "polkadot-parachain-primitives",
+    "polkadot-runtime-common",
+    "staging-parachain-info",
+    # consensus / collators
     "pallet-aura",
+    "pallet-authorship",
+    "pallet-collator-selection",
+    "pallet-session",
+    # balances / fees / utility
     "pallet-balances",
     "pallet-sudo",
     "pallet-timestamp",
     "pallet-transaction-payment",
     "pallet-transaction-payment-rpc-runtime-api",
     "pallet-utility",
-    "staging-parachain-info",
+    # xcm
+    "pallet-message-queue",
+    "pallet-xcm",
+    "staging-xcm",
+    "staging-xcm-builder",
+    "staging-xcm-executor",
+    # governance
+    "pallet-conviction-voting",
+    "pallet-parameters",
+    "pallet-preimage",
+    "pallet-referenda",
+    "pallet-scheduler",
+    "pallet-treasury",
+    "pallet-whitelist",
 ] }
 scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["alloc"] }
@@ -52,6 +79,17 @@ runtime-benchmarks = [
     "pallet-content/runtime-benchmarks",
     "pallet-content-reactions/runtime-benchmarks",
     "polkadot-sdk/runtime-benchmarks",
+]
+
+# Exposed so integration tests can build relay-chain proofs and inspect the
+# collation plumbing without pulling the whole node in.
+try-runtime = [
+    "cumulus-pallet-parachain-system/try-runtime",
+    "pallet-account-content/try-runtime",
+    "pallet-account-profile/try-runtime",
+    "pallet-content/try-runtime",
+    "pallet-content-reactions/try-runtime",
+    "polkadot-sdk/try-runtime",
 ]
 std = [
     "codec/std",

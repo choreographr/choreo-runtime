@@ -5812,6 +5812,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "generate-bags"
+version = "51.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "979de5d55e929c194ed6680f99d71bd1d603215a8b859b7583750c00d36a6017"
+dependencies = [
+ "chrono",
+ "frame-election-provider-support",
+ "frame-support",
+ "frame-system",
+ "num-format",
+ "pallet-staking",
+ "pallet-staking-async",
+ "sp-staking",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12661,6 +12677,7 @@ dependencies = [
  "frame-metadata",
  "frame-support",
  "frame-system-rpc-runtime-api",
+ "frame-try-runtime",
  "futures",
  "futures-timer",
  "jsonrpsee",
@@ -13019,6 +13036,7 @@ dependencies = [
  "frame-system-benchmarking",
  "frame-system-rpc-runtime-api",
  "frame-try-runtime",
+ "generate-bags",
  "pallet-accumulate-and-forward",
  "pallet-alliance",
  "pallet-asset-conversion",
