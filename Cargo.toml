@@ -25,6 +25,7 @@ polkadot-sdk = { version = "2609.2.0", default-features = false, features = [
     "cumulus-pallet-weight-reclaim",
     "cumulus-pallet-xcm",
     "cumulus-pallet-xcmp-queue",
+    "cumulus-pallet-session-benchmarking",
     "cumulus-primitives-core",
     "cumulus-primitives-parachain-inherent",
     "cumulus-primitives-utility",

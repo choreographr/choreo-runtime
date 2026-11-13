@@ -75,9 +75,6 @@ impl pallet_conviction_voting::Config for Runtime {
 // --- scheduler ----------------------------------------------------------------
 
 parameter_types! {
-    pub MaximumSchedulerWeight: frame_support::weights::Weight =
-        Perbill::from_percent(80) * RuntimeBlockWeights::get().max_block;
-    pub const MaxScheduledPerBlock: u32 = 50;
     pub const NoPreimagePostponement: Option<BlockNumber> = Some(10);
 }
 
@@ -86,9 +83,11 @@ impl pallet_scheduler::Config for Runtime {
     type RuntimeOrigin = RuntimeOrigin;
     type PalletsOrigin = OriginCaller;
     type RuntimeCall = RuntimeCall;
-    type MaximumWeight = MaximumSchedulerWeight;
+    // Both values are runtime parameters: governance can retune them with
+    // `Parameters::set_parameter` instead of shipping a runtime upgrade.
+    type MaximumWeight = crate::parameters::dynamic_params::scheduler::MaximumWeight;
     type ScheduleOrigin = EnsureRoot<AccountId>;
-    type MaxScheduledPerBlock = MaxScheduledPerBlock;
+    type MaxScheduledPerBlock = crate::parameters::dynamic_params::scheduler::MaxScheduledPerBlock;
     type WeightInfo = pallet_scheduler::weights::SubstrateWeight<Runtime>;
     type OriginPrivilegeCmp = EqualPrivilegeOnly;
     type Preimages = Preimage;

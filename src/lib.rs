@@ -25,6 +25,8 @@ use sp_session::OpaqueGeneratedSessionKeys;
 
 pub mod genesis_config_presets;
 pub mod governance;
+pub mod parameters;
+pub mod supply_guard;
 pub mod weights;
 pub mod xcm_config;
 
@@ -270,6 +272,9 @@ mod runtime {
 
     #[runtime::pallet_index(28)]
     pub type Origins = governance::custom_origins::Pallet<Runtime>;
+
+    #[runtime::pallet_index(29)]
+    pub type Parameters = pallet_parameters::Pallet<Runtime>;
 }
 
 parameter_types! {
@@ -326,6 +331,9 @@ impl frame_system::Config for Runtime {
     type BlockLength = RuntimeBlockLength;
     type SS58Prefix = SS58PrefixValue;
     type SingleBlockMigrations = SingleBlockMigrations;
+    // Fixed-supply guard: rejects issuance-changing calls reached through any
+    // origin that is not root, including via sudo, batches or scheduling.
+    type BaseCallFilter = supply_guard::SupplyGuard;
 }
 
 impl cumulus_pallet_weight_reclaim::Config for Runtime {
@@ -471,7 +479,7 @@ impl pallet_session::Config for Runtime {
     type DisablingStrategy = ();
     type Currency = Balances;
     type KeyDeposit = ();
-    type WeightInfo = pallet_session::weights::SubstrateWeight<Runtime>;
+    type WeightInfo = weights::pallet_session::WeightInfo<Runtime>;
 }
 
 impl pallet_collator_selection::Config for Runtime {
@@ -492,6 +500,10 @@ impl pallet_collator_selection::Config for Runtime {
     type ValidatorRegistration = Session;
     type WeightInfo = pallet_collator_selection::weights::SubstrateWeight<Runtime>;
 }
+
+/// Session benchmarks need to mint a session key and prove ownership of it.
+/// The implementation lives inside the `Benchmark` runtime API below, so it is
+/// only compiled into the benchmark-enabled wasm.
 
 // --- message queues / xcmp -----------------------------------------------------
 
@@ -574,6 +586,7 @@ type RuntimeExecutive =
 mod benches {
     use super::*;
     use frame_support::traits::{StorageInfo, WhitelistedStorageKeys};
+    use polkadot_sdk::cumulus_pallet_session_benchmarking::Pallet as SessionBench;
     use polkadot_sdk::frame_system_benchmarking::Pallet as SystemBench;
 
     polkadot_sdk::frame_benchmarking::define_benchmarks!(
@@ -581,9 +594,11 @@ mod benches {
         [pallet_account_content, AccountContent]
         [pallet_account_profile, AccountProfile]
         [pallet_balances, Balances]
+        [pallet_collator_selection, CollatorSelection]
         [pallet_content, Content]
         [pallet_content_reactions, ContentReactions]
         [pallet_message_queue, MessageQueue]
+        [pallet_session, SessionBench::<Runtime>]
         [pallet_timestamp, Timestamp]
         [pallet_utility, Utility]
         [cumulus_pallet_xcmp_queue, XcmpQueue]
@@ -761,9 +776,21 @@ impl_runtime_apis! {
             benches::benchmark_metadata(extra)
         }
 
+        #[allow(non_local_definitions)]
         fn dispatch_benchmark(
             config: frame_benchmarking::BenchmarkConfig,
         ) -> Result<Vec<frame_benchmarking::BenchmarkBatch>, alloc::string::String> {
+            // Session benchmarks mint a session key and must prove ownership of
+            // it. Defined here so it only exists in the benchmark build.
+            impl cumulus_pallet_session_benchmarking::Config for Runtime {
+                fn generate_session_keys_and_proof(
+                    owner: Self::AccountId,
+                ) -> (Self::Keys, Vec<u8>) {
+                    let generated = SessionKeys::generate(&owner.encode(), None);
+                    (generated.keys, generated.proof.encode())
+                }
+            }
+
             benches::dispatch_benchmark(config)
         }
     }
@@ -1868,6 +1895,103 @@ mod tests {
                     sp_runtime::transaction_validity::InvalidTransaction::Stale
                 )
             );
+        });
+    }
+
+    /// CHOR's supply is fixed: the only calls that can change `TotalIssuance`
+    /// are root-only, and this runtime refuses them for every non-root origin —
+    /// including when laundered through sudo, a batch or the scheduler.
+    #[test]
+    fn supply_guard_rejects_issuance_calls_from_non_root() {
+        use pallet_balances::AdjustmentDirection;
+        use sp_runtime::traits::Dispatchable;
+
+        new_test_ext().execute_with(|| {
+            fn issuance_call(delta: u128) -> RuntimeCall {
+                RuntimeCall::Balances(pallet_balances::Call::force_adjust_total_issuance {
+                    direction: AdjustmentDirection::Increase,
+                    delta,
+                })
+            }
+
+            let issuance_before = pallet_balances::TotalIssuance::<Runtime>::get();
+
+            // (1) A plain signed caller is rejected.
+            assert!(
+                issuance_call(1_000)
+                    .dispatch(RuntimeOrigin::signed(alice()))
+                    .is_err(),
+                "a signed account must not change issuance"
+            );
+
+            // (2) The sudo key must not be able to launder it. `Sudo::sudo`
+            // dispatches its inner call as Root, so without the guard this
+            // would succeed; the guard inspects the wrapper.
+            let sudo_wrapped = RuntimeCall::Sudo(pallet_sudo::Call::sudo {
+                call: alloc::boxed::Box::new(issuance_call(1_000)),
+            });
+            assert!(
+                sudo_wrapped
+                    .dispatch(RuntimeOrigin::signed(alice()))
+                    .is_err(),
+                "sudo must not be able to change issuance"
+            );
+
+            // (3) Nor through a batch.
+            let batched = RuntimeCall::Utility(pallet_utility::Call::batch {
+                calls: vec![issuance_call(1_000)],
+            });
+            assert!(
+                batched.dispatch(RuntimeOrigin::signed(alice())).is_err(),
+                "a batch must not launder an issuance call"
+            );
+
+            assert_eq!(
+                pallet_balances::TotalIssuance::<Runtime>::get(),
+                issuance_before,
+                "no non-root path may have moved issuance"
+            );
+
+            // (4) Root still reaches it: this is the documented residual — root
+            // means the `root` referendum track (or a runtime upgrade), both
+            // public and slow. That it succeeds here is what proves (2) is the
+            // guard working rather than the pallet's own `ensure_root`.
+            assert!(
+                issuance_call(1_000)
+                    .dispatch(RuntimeOrigin::root())
+                    .is_ok(),
+                "root must retain the root-only path"
+            );
+            assert_eq!(
+                pallet_balances::TotalIssuance::<Runtime>::get(),
+                issuance_before + 1_000,
+                "root issuance change should have applied"
+            );
+        });
+    }
+
+    /// The guard is targeted: ordinary calls pass, and root keeps the
+    /// root-only paths that a `root` referendum legitimately needs.
+    #[test]
+    fn supply_guard_allows_ordinary_calls_and_root_paths() {
+        new_test_ext().execute_with(|| {
+            assert!(supply_guard::SupplyGuard::contains(&transfer_call()));
+
+            let issuance_call = RuntimeCall::Balances(
+                pallet_balances::Call::force_adjust_total_issuance {
+                    direction: pallet_balances::AdjustmentDirection::Increase,
+                    delta: 1,
+                },
+            );
+            // Not *rejected by* the guard — root can still reach it, which is
+            // the documented residual: root == the `root` referendum track.
+            assert!(!supply_guard::SupplyGuard::contains(&issuance_call));
+
+            // But a sudo-wrapped version is recognised as supply-changing.
+            let wrapped = RuntimeCall::Sudo(pallet_sudo::Call::sudo {
+                call: alloc::boxed::Box::new(issuance_call),
+            });
+            assert!(!supply_guard::SupplyGuard::contains(&wrapped));
         });
     }
 }
